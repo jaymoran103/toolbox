@@ -1,6 +1,6 @@
 # The preset kit
 
-`lib/preset_kit.py` is the shared frame for a tool that keeps named presets for one thing and lets you pick one. A preset says which elements show, in what order, and the value of each setting. Every tool on the kit has the same command line, files and keys. Two tools are built on it. `claude-statusline` picks which stats show, and `ghostty-config` sets Ghostty's look and feel.
+`lib/preset_kit.py` is the shared frame for a tool that keeps named presets for one thing and lets you pick one. A preset says which elements show, in what order, and the value of each setting. Every tool on the kit has the same command line, files and keys. Three tools are built on it. `claude-statusline` picks which stats show. `ghostty-config` and `terminal-config` set Ghostty's and macOS Terminal's look and feel.
 
 ## What a tool supplies
 
@@ -60,6 +60,10 @@ All optional. The kit calls them, and a tool overrides the ones it needs.
 | `restore()` | when the picker closes | put the window's colours back |
 | `applied(name, preset)` | when a preset goes into use, or the one in use is edited | write the config fragment |
 
+## Colour
+
+`BG(hex)` and `FG(hex)` give a tool's `render()` its colours. They draw in full colour when `COLORTERM` says the terminal has it, and as the nearest xterm-256 colour otherwise, matched as `color-pick` matches. `PRESET_KIT_COLOURS=full` or `256` overrides the guess. Older macOS Terminal has no full colour, so a tool that draws with these still reads right there.
+
 `pickup` is what the footer says when a preset goes into use. `list_shows = False` drops the list of shown elements under the preview.
 
 ## What every tool gets
@@ -115,6 +119,10 @@ Its elements are segment functions in a dict, `SEGMENTS`. A new stat is one func
 The theme is a `choice` whose options come from a callable: your themes, then Ghostty's. Its `c` action opens `ghostty-theme-edit` on the theme, so the colour tree is reused, not rebuilt. `live()` repaints the window with OSC colour codes as you move through themes and colours.
 
 `GHOSTTY_CONFIG`, `GHOSTTY_THEMES_DIR`, `GHOSTTY_CONFIG_PRESETS_DIR` and `XDG_STATE_HOME` point it at copies, for tests.
+
+## A third example: terminal-config
+
+`bin/terminal-config` does for macOS Terminal what `ghostty-config` does for Ghostty, with the settings Terminal's AppleScript can reach. A preset names a base profile plus changes. With no changes, `applied()` switches to the base profile. With changes, it builds a profile called `toolbox` from the base and the changes. Either way Terminal's default profile, its startup profile and every open tab move to it. AppleScript can't copy a profile's ANSI colours, so `toolbox` keeps Terminal's stock palette. `default` goes back to the profile Terminal used before the tool first ran.
 
 ## Next on the kit
 

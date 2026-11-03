@@ -29,12 +29,64 @@ HEX = re.compile(r"#[0-9a-fA-F]{6}")
 LIST_AT = 7              # a choice with more options than this opens a list
 
 
+# --- colour ----------------------------------------------------------------------
+# Full colour where the terminal says it has it, else the nearest of xterm's
+# 256. PRESET_KIT_COLOURS=full or 256 overrides the guess. The matching is
+# color-pick's, so a colour looks the same in both.
+
+FULL = (os.environ.get("PRESET_KIT_COLOURS") or
+        ("full" if os.environ.get("COLORTERM", "").lower() in ("truecolor", "24bit") else "256")) == "full"
+CUBE = (0, 95, 135, 175, 215, 255)        # the xterm-256 colour cube levels
+SNAPPED, LAB256 = {}, []
+
+
+def rgb(h):
+    return tuple(int(h[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def oklab(h):
+    """h in OKLab, the space where equal steps look equal."""
+    def lin(v):
+        v /= 255
+        return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+    r, g, b = (lin(v) for v in rgb(h))
+    l = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b) ** (1 / 3)
+    m = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b) ** (1 / 3)
+    s = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b) ** (1 / 3)
+    return (0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+            1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+            0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s)
+
+
+def xterm_hex(n):
+    """The colour xterm-256 index n draws, for n from 16 up."""
+    if n >= 232:
+        return "#%02x%02x%02x" % ((8 + 10 * (n - 232),) * 3)
+    n -= 16
+    return "#%02x%02x%02x" % (CUBE[n // 36], CUBE[n // 6 % 6], CUBE[n % 6])
+
+
+def xterm(h):
+    """The xterm-256 index nearest h, by eye. A colour never snaps to a grey,
+    so a dark navy stays blue rather than turning charcoal."""
+    h = h.lower()
+    if h not in SNAPPED:
+        L, a, b = oklab(h)
+        grey = (a * a + b * b) ** 0.5 < 0.02
+        if not LAB256:
+            LAB256.extend(oklab(xterm_hex(n)) for n in range(16, 256))
+        pool = range(240 if grey else 216)
+        SNAPPED[h] = 16 + min(pool, key=lambda i: (LAB256[i][0] - L) ** 2 +
+                              (LAB256[i][1] - a) ** 2 + (LAB256[i][2] - b) ** 2)
+    return SNAPPED[h]
+
+
 def BG(h):
-    return "\x1b[48;2;%d;%d;%dm" % tuple(int(h[i:i + 2], 16) for i in (1, 3, 5))
+    return "\x1b[48;2;%d;%d;%dm" % rgb(h) if FULL else "\x1b[48;5;%dm" % xterm(h)
 
 
 def FG(h):
-    return "\x1b[38;2;%d;%d;%dm" % tuple(int(h[i:i + 2], 16) for i in (1, 3, 5))
+    return "\x1b[38;2;%d;%d;%dm" % rgb(h) if FULL else "\x1b[38;5;%dm" % xterm(h)
 
 
 # --- what a tool supplies ---------------------------------------------------

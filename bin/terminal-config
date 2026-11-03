@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""terminal-config — macOS Terminal's profile, font, colours and window size, as presets.
+
+A preset names a Terminal profile to start from, plus any changes. With no
+changes, using it switches to that profile. With changes, it builds a
+profile called `toolbox` from the base profile and the changes, and
+switches to that. Either way Terminal's default profile, its startup
+profile and every open tab move to the result, so the change shows at once.
+
+The `default` preset goes back to the profile Terminal used before this
+tool first ran. Terminal's AppleScript can't copy a profile's 16 ANSI
+colours. So a `toolbox` profile keeps Terminal's stock palette, and only
+its background, text, bold and cursor colours come from the preset.
+"""
+
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+from preset_kit import BOLD, BG, DIM, FG, Element, Tool, main  # noqa: E402
+
+TARGET = "toolbox"                       # the profile a preset with changes builds
+# Our key -> Terminal's AppleScript property, for every setting a preset can change.
+PROPS = {
+    "background": "background color", "text": "normal text color",
+    "bold-text": "bold text color", "cursor": "cursor color",
+    "font": "font name", "font-size": "font size", "antialias": "font antialiasing",
+    "columns": "number of columns", "rows": "number of rows", "title": "custom title",
+}
+COLOURS = ("background", "text", "bold-text", "cursor")
+STOCK_FONTS = ("SFMono-Regular", "Menlo-Regular", "Monaco")
+
+
+# --- talking to Terminal ----------------------------------------------------------
+
+def osa(script, lang="AppleScript"):
+    try:
+        r = subprocess.run(["osascript", "-l", lang, "-"], input=script, capture_output=True,
+                           text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def quote(s):
+    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def hex_of(text):
+    """AppleScript's 16-bit "r, g, b" as #rrggbb."""
+    try:
+        return "#%02x%02x%02x" % tuple(int(v) // 257 for v in text.split(",")[:3])
+    except ValueError:
+        return None
+
+
+def as_colour(h):
+    return "{%d, %d, %d}" % tuple(int(h[i:i + 2], 16) * 257 for i in (1, 3, 5))
+
+
+_profiles = None
+
+
+def profile_names():
+    global _profiles
+    if _profiles is None:
+        out = osa('tell application "Terminal" to get name of every settings set')
+        _profiles = [n for n in (out or "").split(", ") if n and n != TARGET]
+    return _profiles
+
+
+_fonts = None
+
+
+def font_names():
+    global _fonts
+    if _fonts is None:
+        out = osa("ObjC.import('AppKit'); ObjC.deepUnwrap($.NSFontManager.sharedFontManager"
+                  ".availableFontNamesWithTraits($.NSFixedPitchFontMask)).join('\\n')", "JavaScript")
+        _fonts = list(dict.fromkeys(STOCK_FONTS + tuple(sorted((out or "").splitlines()))))
+    return _fonts
+
+
+_read = {}
+
+
+def profile(name):
+    """A profile's settings, keyed as PROPS, read once per run."""
+    if name not in _read:
+        lines = "\n".join(f'set end of out to ({p} of s) as text' for p in PROPS.values())
+        out = osa(f'''set AppleScript's text item delimiters to ","
+tell application "Terminal"
+  set s to settings set {quote(name)}
+  set out to {{}}
+  {lines}
+end tell
+set AppleScript's text item delimiters to "\\t"
+return out as text''')
+        vals = dict(zip(PROPS, out.split("\t"))) if out else {}
+        for k in COLOURS:
+            if k in vals:
+                vals[k] = hex_of(vals[k])
+        _read[name] = vals
+    return _read[name]
+
+
+# --- the tool -------------------------------------------------------------------
+
+def el(key, label, group, kind, **kw):
+    return Element(key, label, kind=kind, group=group, optional=True, **kw)
+
+
+class TerminalConfig(Tool):
+    name = "terminal-config"
+    title = "macOS Terminal's profile, font, colours and size"
+    pickup = "Terminal and its open tabs switched"
+    list_shows = False
+    elements = (
+        el("profile", "base profile", "Profile", "choice", choices=profile_names),
+        el("background", "background", "Colours", "color"),
+        el("text", "text", "Colours", "color"),
+        el("bold-text", "bold text", "Colours", "color"),
+        el("cursor", "cursor", "Colours", "color"),
+        el("font", "font", "Font", "choice", choices=font_names),
+        el("font-size", "size", "Font", "number", lo=8, hi=36, step=1, default=12),
+        el("antialias", "smooth edges", "Font", "choice", choices=("true", "false")),
+        el("columns", "columns", "Window", "number", lo=40, hi=300, step=2, default=80),
+        el("rows", "rows", "Window", "number", lo=10, hi=100, step=1, default=24),
+        el("title", "title", "Window", "text"),
+    )
+    builtins = {
+        "default": {},
+        "pro": {"set": {"profile": "Pro"}},
+        "homebrew": {"set": {"profile": "Homebrew"}},
+        "roomy": {"set": {"font-size": 14, "columns": 120, "rows": 36}},
+    }
+
+    def original(self):
+        """The profile Terminal used before this tool first ran."""
+        path = os.path.join(self.state_dir, "original")
+        try:
+            with open(path) as f:
+                return f.read().strip()
+        except OSError:
+            pass
+        name = osa('tell application "Terminal" to get name of default settings') or "Basic"
+        if name != TARGET:
+            os.makedirs(self.state_dir, exist_ok=True)
+            with open(path, "w") as f:
+                f.write(name + "\n")
+        return name
+
+    def base(self, preset):
+        return preset["set"].get("profile") or self.original()
+
+    def changes(self, preset):
+        return {k: preset["set"][k] for k in PROPS if preset["set"].get(k) is not None}
+
+    def effective(self, preset):
+        out = dict(profile(self.base(preset)))
+        out.update(self.changes(preset))
+        return out
+
+    def value(self, key):
+        if key == "profile":
+            return self.original()
+        return str(profile(self.original()).get(key) or "")
+
+    # --- hooks ----------------------------------------------------------------
+
+    def applied(self, name, preset):
+        changes = self.changes(preset)
+        target = TARGET if changes else self.base(preset)
+        build = ""
+        if changes:
+            sets = []
+            for k, v in self.effective(preset).items():
+                if v in (None, ""):
+                    continue
+                if k in COLOURS:
+                    v = as_colour(v)
+                elif k == "antialias":
+                    v = "true" if str(v) == "true" else "false"
+                elif k in ("font", "title"):
+                    v = quote(v)
+                sets.append(f"  try\n    set {PROPS[k]} of t to {v}\n  end try")
+            if "title" in changes:
+                sets.append("  set title displays custom title of t to true")
+            build = (f'  if not (exists settings set "{TARGET}") then make new settings set '
+                     f'with properties {{name:"{TARGET}"}}\n  set t to settings set "{TARGET}"\n'
+                     + "\n".join(sets) + "\n")
+        osa(f'''tell application "Terminal"
+{build}  set p to settings set {quote(target)}
+  set default settings to p
+  set startup settings to p
+  repeat with w in windows
+    repeat with b in tabs of w
+      set current settings of b to p
+    end repeat
+  end repeat
+end tell''')
+        _read.pop(TARGET, None)
+
+    # --- preview --------------------------------------------------------------
+
+    def render(self, preset, width):
+        eff, changes = self.effective(preset), self.changes(preset)
+        bg, fg = eff.get("background") or "#000000", eff.get("text") or "#ffffff"
+        bold, cur = eff.get("bold-text") or fg, eff.get("cursor") or fg
+        w = min(width, 46)
+
+        def row(*parts):
+            text, out = "", BG(bg)
+            for s, col, b in parts:
+                out += FG(col) + (BOLD if b else "") + s + "\x1b[22m"
+                text += s
+            return out + " " * max(0, w - len(text)) + "\x1b[0m"
+
+        prompt = BG(bg) + FG(fg) + " ~ % " + BG(cur) + " " + BG(bg) + " " * (w - 6) + "\x1b[0m"
+        out = [row(("", fg, False)),
+               row((" Last login: Mon Nov  3 09:12 on ttys001", fg, False)),
+               row((" ~ % ", fg, False), ("ls", bold, True)),
+               row((" Desktop  Documents  Downloads", fg, False)),
+               prompt,
+               row(("", fg, False))]
+        target = TARGET if changes else self.base(preset)
+        out += ["",
+                f"{DIM}profile\x1b[0m {target}" + (f" · from {self.base(preset)}" if changes else ""),
+                f"{DIM}font\x1b[0m    {eff.get('font', '–')} {eff.get('font-size', '')}",
+                f"{DIM}window\x1b[0m  {eff.get('columns', '–')}×{eff.get('rows', '–')}"
+                + (f" · title {eff['title']}" if preset['set'].get('title') else ""),
+                ""]
+        if changes:
+            out.append(DIM + f"builds `{TARGET}` with {len(changes)} change" + ("s" if len(changes) > 1 else "") + "\x1b[0m")
+            out += [f"  {self.element(k).label} = {v}" for k, v in changes.items()]
+            out.append(DIM + "ANSI colours: Terminal's stock palette" + "\x1b[0m")
+        else:
+            out.append(DIM + f"switches to {target}, unchanged" + "\x1b[0m")
+        return out
+
+
+if __name__ == "__main__":
+    main(TerminalConfig(), sys.argv[1:])

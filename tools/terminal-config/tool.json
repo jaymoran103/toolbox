@@ -1,0 +1,15 @@
+{
+  "name": "terminal-config",
+  "about": "macOS Terminal's profile, font, colours and size, kept as presets",
+  "template": "preset-kit",
+  "entries": [
+    "bin/terminal-config"
+  ],
+  "links": {
+    "presets/terminal-config": "~/.config/terminal-config/presets"
+  },
+  "needs": [
+    "python3",
+    "osascript"
+  ]
+}
