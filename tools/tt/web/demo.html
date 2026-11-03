@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>timetools demo</title>
+<style>
+  :root { --bg: #0d0d14; --panel: #171723; --line: #2a2a3a; --text: #e8e8f2; --dim: #8a8aa3; --pink: #ff46aa; --cyan: #00dcff; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 ui-sans-serif, system-ui, sans-serif; }
+  main { max-width: 960px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.lead { color: var(--dim); margin: 0 0 24px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  h2 { font-size: 13px; letter-spacing: .12em; text-transform: uppercase; color: var(--dim); margin: 0 0 12px; }
+  .readout { font: 600 32px/1.2 ui-monospace, Menlo, monospace; margin-bottom: 12px; min-height: 40px; }
+  button { font: inherit; color: var(--text); background: #24243a; border: 1px solid var(--line); border-radius: 8px; padding: 8px 14px; cursor: pointer; }
+  button:hover { border-color: var(--cyan); }
+  button.hot { background: linear-gradient(90deg, var(--pink), #9a5aff); border: 0; }
+  section.wide { margin-bottom: 16px; }
+  .hint { color: var(--dim); font-size: 13px; margin: 12px 0 0; }
+  tt-menu { color: var(--text); }
+  tt-fireworks { height: 260px; border-radius: 10px; background: #07070c; border: 1px solid var(--line); margin-bottom: 16px; }
+  code { font: 13px ui-monospace, Menlo, monospace; color: var(--cyan); }
+  #log { font: 12px/1.6 ui-monospace, Menlo, monospace; color: var(--dim); height: 120px; overflow: auto; white-space: pre; }
+</style>
+</head>
+<body>
+<main>
+  <h1>timetools</h1>
+  <p class="lead">Every control here is plain markup. No page script except the event log.</p>
+
+  <section class="wide">
+    <h2>Presets</h2>
+    <tt-menu></tt-menu>
+    <p class="hint">The same lines run in a terminal: <code>tt run "metronome 96 --for 4m -b 3"</code>. Served over http, this page also loads <code>presets/examples.tt</code>.</p>
+  </section>
+
+  <tt-fireworks id="sky" trigger="load" span="8s" rate="1.5/s" seed="4" crackle="2"></tt-fireworks>
+
+  <div class="grid">
+    <section>
+      <h2>Fireworks</h2>
+      <p><button class="hot" data-tt="fireworks" data-tt-span="3s" data-tt-count="4-6">Celebrate</button></p>
+      <p><button data-tt="fireworks" data-tt-target="#sky" data-tt-span="2s" data-tt-count="3" data-tt-origin="random" data-tt-colors="gold,#ff3366">Fire in the box</button></p>
+      <p><button data-tt-run="fireworks forever -r 20-40/m --cluster 2-4 --within 1.5s --palette ember">Tavern mode</button></p>
+      <code>data-tt="fireworks"</code>
+    </section>
+    <section>
+      <h2>Timer</h2>
+      <div class="readout" id="timer-out">00:10</div>
+      <button data-tt="timer" data-tt-duration="10s" data-tt-target="#timer-out" data-tt-sound="true">Start / pause</button>
+    </section>
+    <section>
+      <h2>Stopwatch</h2>
+      <div class="readout" id="sw-out">00:00.00</div>
+      <button data-tt="stopwatch" data-tt-target="#sw-out">Start / pause</button>
+    </section>
+    <section>
+      <h2>Metronome</h2>
+      <div class="readout" id="m-out">96 bpm</div>
+      <button data-tt="metronome" data-tt-bpm="96" data-tt-beats="3" data-tt-target="#m-out" data-tt-sound="true">Start / pause</button>
+    </section>
+    <section>
+      <h2>Counter</h2>
+      <div class="readout" id="c-out">0</div>
+      <button data-tt="counter" data-tt-label="clicks" data-tt-target="#c-out">Add one</button>
+    </section>
+    <section>
+      <h2>Events</h2>
+      <div id="log"></div>
+    </section>
+  </div>
+</main>
+<script type="text/tt">
+[practice]
+@gap 2s
+metronome 96 --for 8s -b 3 --label "Verse"
+metronome 132 --for 8s --label "Chorus"
+
+[cube]
+@repeat 3
+@advance key
+@score wca
+timer 5s --label "Inspect {n}" --rings 1
+stopwatch --solve --cap 1m --label "Solve {n}"
+
+[storm]
+fireworks 20s -r 1-3/s --palette frost
+</script>
+<script type="text/tt" src="../presets/examples.tt"></script>
+<script type="module">
+  import "./timetools.js";
+  const log = document.getElementById("log");
+  for (const name of ["start", "burst", "beat", "lap", "change", "pause", "done", "step", "ready", "summary"]) {
+    document.addEventListener("tt:" + name, (e) => {
+      log.textContent = `tt:${name.padEnd(6)} ${e.detail.label || e.detail.tool || e.detail.preset || ""}\n` + log.textContent.split("\n").slice(0, 40).join("\n");
+    });
+  }
+</script>
+</body>
+</html>

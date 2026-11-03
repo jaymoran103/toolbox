@@ -1,0 +1,25 @@
+# Example presets. `tt presets` lists them, `tt run <name>` plays one, and
+# web pages load the same file with <script type="text/tt" src="examples.tt">.
+
+[setlist]
+# A practice set: one metronome per song, with a short break between.
+@gap 15s
+metronome 92 --for 3m30s -b 4 --label "Opener"
+metronome 120 --for 4m -b 3 --label "Waltz"
+metronome 76 --for 5m -b 4 --label "Ballad"
+metronome 140 --for 2m45s -b 4 --label "Closer"
+
+[gauntlet]
+# Five cube solves: inspect, solve, press space to submit. Scored like WCA.
+@repeat 5
+@advance key
+@score wca
+timer 15s --label "Inspect {n}" --rings 1
+stopwatch --solve --cap 2m --label "Solve {n}"
+
+[tavern]
+# Sporadic explosions for a game night: a few clumps an hour, until stopped.
+fireworks forever -r 4-8/h --cluster 2-4 --within 3s --palette ember --sound
+
+[finale]
+fireworks 45s -r 2-4/s --palette gold --crackle 3
