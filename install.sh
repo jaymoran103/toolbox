@@ -6,6 +6,7 @@
 #   ./install.sh <tool>...   just these
 #   ./install.sh --list      each tool, its template, and anything it needs
 #
+# An entry "path as name" links path onto PATH under another name.
 # A real file in the way is moved aside to <path>.pre-toolbox.<time>.
 # A symlink in the way is replaced. TOOLBOX_BIN changes the PATH folder.
 set -eu
@@ -49,7 +50,8 @@ for n in args or tools:
     m = tools[n]
     print(n)
     for e in m.get("entries", []):
-        link(os.path.join(root, e), os.path.join(bindir, os.path.basename(e)))
+        path, _, name = e.partition(" as ")
+        link(os.path.join(root, path), os.path.join(bindir, name or os.path.basename(path)))
     for src, dest in m.get("links", {}).items():
         link(os.path.join(root, src), dest)
     missing = [x for x in m.get("needs", []) if not shutil.which(x)]

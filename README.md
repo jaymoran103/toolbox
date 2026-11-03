@@ -17,6 +17,8 @@ A template lives in `lib/` and its contract in `docs/`. Each tool is one script 
 | preset kit, `lib/preset_kit.py` | config tools: presets you preview, edit, save and switch | `docs/preset-kit.md` |
 | picker contract | pickers: one result, raw or from a TUI | `docs/pickers.md` |
 
+`tt` lives whole in `tools/tt/`, as a git subtree of its own repo. Update it with `git subtree pull --prefix=tools/tt https://github.com/jaymoran103/timetools.git main --squash`.
+
 `ghostty-config` is the model tool. Read it beside `docs/preset-kit.md` before writing a new one.
 
 ## Layout

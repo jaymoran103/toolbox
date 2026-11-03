@@ -1,0 +1,12 @@
+{
+  "name": "icons-batch",
+  "about": "one DiceBear blob icon PNG per seed",
+  "template": "none",
+  "entries": [
+    "bin/icons-batch"
+  ],
+  "links": {},
+  "needs": [
+    "npx"
+  ]
+}

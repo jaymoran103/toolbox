@@ -1,0 +1,20 @@
+{
+  "name": "tt",
+  "about": "stopwatch, timer, metronome, counter and fireworks, sharing one preset syntax",
+  "template": "own",
+  "entries": [
+    "tools/tt/bin/tt",
+    "tools/tt/bin/tt as stopwatch",
+    "tools/tt/bin/tt as timer",
+    "tools/tt/bin/tt as metronome",
+    "tools/tt/bin/tt as counter",
+    "tools/tt/bin/tt as fireworks"
+  ],
+  "links": {
+    "presets/tt": "~/.config/timetools"
+  },
+  "needs": [
+    "python3"
+  ],
+  "source": "git subtree from https://github.com/jaymoran103/timetools.git main"
+}
