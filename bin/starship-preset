@@ -1,234 +1,246 @@
-#!/usr/bin/env bash
-# starship-preset — pick a Starship prompt config from a live-previewing list.
-#
-#   starship-preset              picker: Enter uses it in every shell
-#   starship-preset <name>       use <name> in every shell, no UI
-#   starship-preset -H [name]    the same, for this project only
-#   starship-preset -r [-H]      back to the default, everywhere or here
-#   starship-preset -s           say which config this directory uses
-#   starship-preset -l           list presets
-#   starship-preset --save NAME  keep the config in use here as a preset
-#   starship-preset -e [name]    open a preset in $EDITOR
-#
-# A project is the git top level, or the directory when there is none.
-# Its pick beats the everywhere pick. The list holds `default` (the
-# config), your presets, then Starship's built-in ones. The preview
-# draws each preset's real prompt for the directory you started in.
-# zsh/starship-preset.zsh reads the pick before every prompt, so open
-# shells switch on their next prompt.
-set -euo pipefail
+#!/usr/bin/env python3
+"""starship-preset — what your Starship prompt shows, kept as presets.
 
-# fzf re-invokes this script for the preview, so it needs an absolute path
-# regardless of how the user typed the command.
-SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+A preset starts from a base config and picks which modules show, in what
+order. The base is your own config, no config, or one of Starship's
+built-in presets, and it gives the modules their look. The preview draws
+the real prompt for the directory you started in, and each module's row
+shows what it prints there.
 
-DEFAULT="$HOME/.config/starship.toml"
-PRESETS="${STARSHIP_PRESETS_DIR:-$HOME/.config/starship/presets}"
-STATE="${XDG_STATE_HOME:-$HOME/.local/state}/starship-preset"
-BUILTIN="$STATE/builtin"
-# Keep these two file names in step with zsh/starship-preset.zsh.
-GLOBAL="$STATE/global"        # one path
-PROJECTS="$STATE/projects"    # dir<TAB>path, one a line
+Using a preset writes ~/.local/state/starship-preset/active.toml. The zsh
+hook, tools/starship-preset/starship-preset.zsh, points STARSHIP_CONFIG at
+it before every prompt, so open shells switch on their next prompt.
 
-die() { printf 'starship-preset: %s\n' "$1" >&2; exit 1; }
+  starship-preset -H [preset]   pick for this project only: the git top
+                                level, or this folder. It beats the
+                                everywhere pick, and -H -r drops it.
+"""
 
-# --- names and paths -----------------------------------------------------
-# Built-ins are written out fresh each run, so a Starship upgrade shows up.
-# It takes a few milliseconds for all of them.
-refresh_builtin() {
-  mkdir -p "$BUILTIN"
-  local n
-  for n in $(starship preset --list); do
-    starship preset "$n" -o "$BUILTIN/$n.toml" 2>/dev/null || true
-  done
-}
+import json
+import os
+import re
+import subprocess
+import sys
 
-user_names() {
-  [ -d "$PRESETS" ] || return 0
-  find -L "$PRESETS" -maxdepth 1 -type f -name '*.toml' ! -name '.*' \
-    -exec basename {} .toml \; | sort
-}
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+from preset_kit import DIM, Element, Tool, main  # noqa: E402
 
-# Lines of name<TAB>source. A preset of yours hides a built-in of the
-# same name.
-listing() {
-  local mine n
-  mine=$(user_names)
-  printf 'default\tconfig\n'
-  for n in $mine; do [ "$n" = default ] || printf '%s\tyours\n' "$n"; done
-  for n in $(starship preset --list); do
-    printf '%s\n' "$mine" | grep -qx "$n" || printf '%s\tbuilt-in\n' "$n"
-  done
-}
+HOME = os.path.expanduser("~")
+YOUR_CONFIG = os.path.join(HOME, ".config", "starship.toml")
+HERE = os.environ.get("STARSHIP_PRESET_HERE") or os.getcwd()
+# The modules worth listing, in a sensible default order. Starship has more.
+MODULES = (
+    ("os", "OS icon"), ("username", "user"), ("hostname", "host"), ("localip", "local IP"),
+    ("directory", "directory"), ("git_branch", "git branch"), ("git_commit", "git commit"),
+    ("git_state", "git state"), ("git_status", "git status"), ("git_metrics", "git +/− lines"),
+    ("package", "package version"), ("nodejs", "Node"), ("bun", "Bun"), ("deno", "Deno"),
+    ("python", "Python"), ("conda", "conda env"), ("rust", "Rust"), ("golang", "Go"),
+    ("java", "Java"), ("ruby", "Ruby"), ("docker_context", "Docker context"),
+    ("kubernetes", "Kubernetes"), ("aws", "AWS"), ("gcloud", "gcloud"), ("nix_shell", "nix shell"),
+    ("memory_usage", "memory"), ("battery", "battery"), ("cmd_duration", "command time"),
+    ("jobs", "background jobs"), ("status", "exit status"), ("sudo", "sudo"), ("shell", "shell name"),
+    ("time", "clock"), ("fill", "fill to the right"), ("line_break", "line break"),
+    ("character", "prompt character"),
+)
 
-path_of() {
-  case "$1" in
-    default) printf '%s\n' "$DEFAULT" ;;
-    *) if   [ -f "$PRESETS/$1.toml" ]; then printf '%s\n' "$PRESETS/$1.toml"
-       elif [ -f "$BUILTIN/$1.toml" ]; then printf '%s\n' "$BUILTIN/$1.toml"
-       else return 1; fi ;;
-  esac
-}
 
-name_of() {
-  if [ "$1" = "$DEFAULT" ]; then printf 'default\n'; else basename "$1" .toml; fi
-}
+# --- configs ------------------------------------------------------------------------
 
-project_dir() {
-  git -C "${1:-$PWD}" rev-parse --show-toplevel 2>/dev/null || (cd "${1:-$PWD}" && pwd -P)
-}
+def run(*args, **kw):
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=10, **kw)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 else None
 
-# --- which config a directory uses --------------------------------------
-# Prints path<TAB>why. The longest project match wins, then the global pick.
-# The zsh hook does the same walk without forking.
-in_use() {
-  local dir="$1" p f best='' bestdir=''
-  if [ -f "$PROJECTS" ]; then
-    while IFS=$'\t' read -r p f; do
-      case "$dir/" in
-        "$p"/*) [ ${#p} -gt ${#bestdir} ] && { bestdir=$p; best=$f; } ;;
-      esac
-    done < "$PROJECTS"
-  fi
-  if [ -n "$best" ] && [ -f "$best" ]; then printf '%s\tproject %s\n' "$best" "$bestdir"; return; fi
-  if [ -f "$GLOBAL" ]; then
-    f=$(cat "$GLOBAL")
-    [ -f "$f" ] && { printf '%s\teverywhere\n' "$f"; return; }
-  fi
-  printf '%s\tdefault\n' "$DEFAULT"
-}
 
-# --- persist -------------------------------------------------------------
-# Built-ins live in the state dir, which a later run rewrites in place, so a
-# saved path stays good.
-set_global() { mkdir -p "$STATE"; printf '%s\n' "$1" > "$GLOBAL"; }
-clear_global() { rm -f "$GLOBAL"; }
+_bases = None
 
-set_project() { # set_project <dir> [path]; no path clears it
-  mkdir -p "$STATE"
-  local tmp; tmp=$(mktemp)
-  [ -f "$PROJECTS" ] && awk -F'\t' -v d="$1" '$1 != d' "$PROJECTS" > "$tmp"
-  [ -n "${2:-}" ] && printf '%s\t%s\n' "$1" "$2" >> "$tmp"
-  mv "$tmp" "$PROJECTS"
-}
 
-apply() { # apply <name>
-  local path; path=$(path_of "$1") || die "unknown preset '$1' (try -l)"
-  if [ "$HERE" = 1 ]; then
-    set_project "$(project_dir)" "$path"
-    printf '%s · project %s\n' "$1" "$(project_dir)"
-  else
-    if [ "$1" = default ]; then clear_global; else set_global "$path"; fi
-    printf '%s · everywhere\n' "$1"
-  fi
-}
+def base_names():
+    global _bases
+    if _bases is None:
+        _bases = ["your config", "none"] + (run("starship", "preset", "--list") or "").split()
+    return _bases
 
-# --- preview pane --------------------------------------------------------
-# `starship prompt` wraps its escapes in %{ %} when it knows the shell is
-# zsh. The pane wants plain ANSI, so the shell is unset. The directory
-# module reads $PWD, so the render runs from the directory it draws.
-render() { # render <path> <dir> [prompt args…]
-  local path="$1" dir="$2"; shift 2
-  (cd "$dir" 2>/dev/null && env -u STARSHIP_SHELL STARSHIP_CONFIG="$path" PWD="$dir" \
-    starship prompt -p "$dir" -w "$COLS" "$@" 2>/dev/null) || true
-}
 
-# The modules the top-level format strings name, in order, deduped. Module
-# tables come after them, and their own format keys are not wanted.
-modules() {
-  awk '
-    on { s = s $0 "\n"; if (index($0, "\"\"\"")) on = 0; next }
-    /^[[:space:]]*\[/ { exit }
-    /^[[:space:]]*(right_)?format[[:space:]]*=/ {
-      v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); s = s v "\n"
-      if (substr(v, 1, 3) == "\"\"\"" && !index(substr(v, 4), "\"\"\"")) on = 1
+def base_text(base):
+    if base in (None, "your config"):
+        try:
+            with open(YOUR_CONFIG) as f:
+                return f.read()
+        except OSError:
+            return ""
+    if base == "none":
+        return ""
+    return run("starship", "preset", base) or ""
+
+
+def strip_top(text, keys):
+    """text without the top-level `keys`, multi-line strings and all. Lines
+    inside any multi-line string never count as table headings."""
+    out, open_q, dropping, in_table = [], None, False, False
+    for line in text.splitlines():
+        if open_q:
+            if open_q in line:
+                open_q = None
+            if not dropping:
+                out.append(line)
+            continue
+        s = line.strip()
+        if s.startswith("["):
+            in_table = True
+        m = re.match(r"([A-Za-z0-9_-]+)\s*=\s*(.*)", s)
+        drop = bool(m and not in_table and m.group(1) in keys)
+        if m:
+            for q in ('"""', "'''"):
+                if m.group(2).startswith(q) and m.group(2).count(q) == 1:
+                    open_q, dropping = q, drop
+        if not drop:
+            out.append(line)
+    return "\n".join(out) + "\n"
+
+
+# --- the tool -------------------------------------------------------------------
+
+class StarshipPreset(Tool):
+    name = "starship-preset"
+    title = "what your Starship prompt shows"
+    pickup = "open shells switch on their next prompt"
+    elements = tuple(Element(k, label) for k, label in MODULES) + (
+        Element("base", "base config", kind="choice", choices=base_names, optional=True),
+        Element("add_newline", "blank line before", kind="choice", choices=("true", "false"), optional=True),
+    )
+    builtins = {
+        "default": {},
+        "minimal": {"show": ["directory", "git_branch", "character"], "set": {"add_newline": "false"}},
+        "two-line": {"show": ["directory", "git_branch", "git_status", "cmd_duration", "line_break", "character"]},
+        "full": {"show": ["username", "hostname", "directory", "git_branch", "git_status", "package", "nodejs",
+                          "python", "rust", "golang", "cmd_duration", "jobs", "fill", "time", "line_break",
+                          "character"]},
     }
-    END { print s }' "$1" |
-    grep -oE '\$[a-z_]+' | sed 's/^\$//' |
-    awk '$0 != "all" && !seen[$0]++' | tr '\n' ' '
-}
+    builtins.update({n: {"set": {"base": n}} for n in (run("starship", "preset", "--list") or "").split()})
+    scope = None          # a project folder, under -H
 
-preview() {
-  local name="$1" path dir right
-  path=$(path_of "$name") || { printf '\n  (missing preset file)\n'; return; }
-  dir="${STARSHIP_PRESET_HERE:-$PWD}"
-  COLS="${FZF_PREVIEW_COLUMNS:-60}"
+    # --- picks, everywhere or per project ------------------------------------------
 
-  printf '\033[1m%s\033[0m' "$name"
-  [ "$path" = "$(in_use "$dir" | cut -f1)" ] && printf '  \033[2m· in use here\033[0m'
-  case "$path" in
-    "$BUILTIN"/*) printf '\n\033[2mbuilt in to Starship\033[0m\n' ;;
-    *) printf '\n\033[2m%s\033[0m\n' "${path/#$HOME/~}" ;;
-  esac
+    def file(self, name):
+        return os.path.join(self.state_dir, name)
 
-  printf '\n\033[2m── here ──\033[0m'
-  render "$path" "$dir"
-  right=$(render "$path" "$dir" --right)
-  [ -n "$right" ] && printf '\n\033[2mright:\033[0m %s' "$right"
-  printf '\n\n\033[2m── after a failed 4s command ──\033[0m'
-  render "$path" "$dir" -s 1 -d 4000
-  printf '\n\n\033[2m── home ──\033[0m'
-  render "$path" "$HOME"
-  printf '\n\n\033[2m── shows ──\033[0m\n'
-  if grep -qE '^[[:space:]]*format[[:space:]]*=' "$path"; then
-    modules "$path" | fold -s -w "$COLS"
-  else
-    printf 'every module, in the default order'
-  fi
-  printf '\n'
-}
+    def read_lines(self, name):
+        try:
+            with open(self.file(name)) as f:
+                return [ln.rstrip("\n").split("\t") for ln in f if "\t" in ln]
+        except OSError:
+            return []
 
-# --- entry points --------------------------------------------------------
-HERE=0
-case "${1:-}" in
-  -H|--here) HERE=1; shift ;;
-esac
+    def write_lines(self, name, rows):
+        os.makedirs(self.state_dir, exist_ok=True)
+        with open(self.file(name), "w") as f:
+            f.writelines("\t".join(r) + "\n" for r in rows)
 
-case "${1:-}" in
-  --preview) preview "$2"; exit 0 ;;
-  -l|--list) refresh_builtin; listing | column -t -s $'\t'; exit 0 ;;
-  -s|--status)
-    IFS=$'\t' read -r p why <<< "$(in_use "$PWD")"
-    printf '%s · %s\n' "$(name_of "$p")" "$why"; exit 0 ;;
-  -r|--reset)
-    [ "${2:-}" = -H ] || [ "${2:-}" = --here ] && HERE=1
-    if [ "$HERE" = 1 ]; then set_project "$(project_dir)"; else clear_global; fi
-    IFS=$'\t' read -r p why <<< "$(in_use "$PWD")"
-    printf 'now %s · %s\n' "$(name_of "$p")" "$why"; exit 0 ;;
-  --save)
-    [ -n "${2:-}" ] || die "--save needs a name"
-    case "$2" in */*|default) die "bad preset name '$2'" ;; esac
-    [ -f "$PRESETS/$2.toml" ] && die "preset '$2' exists; pick another name"
-    mkdir -p "$PRESETS"
-    cp "$(in_use "$PWD" | cut -f1)" "$PRESETS/$2.toml"
-    printf 'saved %s\n' "${PRESETS/#$HOME/~}/$2.toml"; exit 0 ;;
-  -e|--edit)
-    refresh_builtin
-    name="${2:-$(name_of "$(in_use "$PWD" | cut -f1)")}"
-    path=$(path_of "$name") || die "unknown preset '$name' (try -l)"
-    case "$path" in "$BUILTIN"/*) die "'$name' is built in; --save a copy to edit it" ;; esac
-    exec ${EDITOR:-vi} "$path" ;;
-  -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-  -*) die "unknown option '$1' (try -h)" ;;
-esac
+    def active(self):
+        if self.scope:
+            mine = dict(self.read_lines("project-picks")).get(self.scope)
+            if mine and self.source(mine):
+                return mine
+        return super().active()
 
-command -v starship >/dev/null || die "starship not found (brew install starship)"
-refresh_builtin
+    def set_active(self, name):
+        if not self.scope:
+            return super().set_active(name)
+        picks = [r for r in self.read_lines("project-picks") if r[0] != self.scope]
+        paths = [r for r in self.read_lines("projects") if r[0] != self.scope]
+        if name != self.default:
+            picks.append([self.scope, name])
+            paths.append([self.scope, self.config_file(name, self.load(name))])
+        self.write_lines("project-picks", picks)
+        self.write_lines("projects", paths)
 
-if [ -n "${1:-}" ]; then apply "$1"; exit 0; fi
+    def config_file(self, name, preset):
+        """Write the preset's config and return its path."""
+        slug = "active" if not self.scope else "project-" + re.sub(r"[^A-Za-z0-9]+", "-", self.scope).strip("-")
+        path = self.file(slug + ".toml")
+        os.makedirs(self.state_dir, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(f"# Written by starship-preset from preset {name}. Edit the preset, not this file.\n")
+            f.write(self.text(preset))
+        return path
 
-command -v fzf >/dev/null || die "fzf not found (brew install fzf)"
-export STARSHIP_PRESET_HERE="$PWD"
-current=$(name_of "$(in_use "$PWD" | cut -f1)")
-pos=$(listing | cut -f1 | grep -nx "$current" | cut -d: -f1 || true)
-if [ "$HERE" = 1 ]; then where="this project"; else where="every shell"; fi
+    def text(self, preset):
+        s, show = preset["set"], preset["show"]
+        base = base_text(s.get("base"))
+        drop = (["format"] if show else []) + (["add_newline"] if s.get("add_newline") else [])
+        head = ""
+        if show:
+            head += 'format = "' + "".join(f"${m}" for m in show) + '"\n'
+        if s.get("add_newline"):
+            head += f"add_newline = {s['add_newline']}\n"
+        return head + strip_top(base, drop) if drop else head + base
 
-picked=$(listing | fzf \
-  --height=100% --layout=reverse --info=inline --pointer='>' \
-  --prompt='prompt > ' --delimiter=$'\t' --with-nth=1,2 --tabstop=24 \
-  --header="enter use in $where · esc cancel" \
-  --bind="load:pos(${pos:-1})" \
-  --preview="'$SELF' --preview {1}" --preview-window='right:60%:border-left' \
-) || exit 0
+    def applied(self, name, preset):
+        if self.scope:
+            self.set_active(name)
+            return
+        path = self.file("global")
+        if name == self.default and not preset["show"] and not any(preset["set"].values()):
+            try:
+                os.remove(path)        # your own config, as it is
+            except OSError:
+                pass
+            return
+        os.makedirs(self.state_dir, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(self.config_file(name, preset) + "\n")
 
-apply "${picked%%$'\t'*}"
+    # --- preview --------------------------------------------------------------
+
+    def prompt(self, preset, *args, width=80):
+        tmp = self.file(".preview.toml")
+        os.makedirs(self.state_dir, exist_ok=True)
+        with open(tmp, "w") as f:
+            f.write(self.text(preset))
+        env = {k: v for k, v in os.environ.items() if k != "STARSHIP_SHELL"}
+        env.update(STARSHIP_CONFIG=tmp, PWD=HERE)
+        return run("starship", *args, "-p", HERE, "-w", str(width), cwd=HERE, env=env) or ""
+
+    _values = {}
+
+    def value(self, key):
+        if key not in dict(MODULES):
+            return ""
+        if key not in self._values:
+            out = self.prompt({"show": [], "set": {}}, "module", key)
+            self._values[key] = re.sub(r"\x1b\[[0-9;]*m", "", out).strip()
+        return self._values[key]
+
+    _rendered = {}
+
+    def render(self, preset, width):
+        mark = json.dumps(preset, sort_keys=True) + str(width)
+        if mark not in self._rendered:
+            left = self.prompt(preset, "prompt", width=width).strip("\n").split("\n")
+            right = self.prompt(preset, "prompt", "--right", width=width).strip()
+            failed = self.prompt(preset, "prompt", "-s", "1", "-d", "4000", width=width).strip("\n").split("\n")
+            out = [DIM + "here\x1b[0m"] + left
+            if right:
+                out += [DIM + "right:\x1b[0m " + right]
+            out += ["", DIM + "after a failed 4s command\x1b[0m"] + failed + [""]
+            base = preset["set"].get("base") or "your config"
+            out.append(DIM + f"base: {base}" + (" · your module order" if preset["show"] else " · its own order")
+                       + "\x1b[0m")
+            self._rendered[mark] = out
+        return self._rendered[mark]
+
+
+def project_dir():
+    top = run("git", "-C", HERE, "rev-parse", "--show-toplevel")
+    return top.strip() if top else os.path.realpath(HERE)
+
+
+if __name__ == "__main__":
+    tool, argv = StarshipPreset(), sys.argv[1:]
+    if argv[:1] in (["-H"], ["--here"]):
+        tool.scope, argv = project_dir(), argv[1:]
+        tool.title = f"this project only · {tool.scope.replace(HOME, '~', 1)}"
+    main(tool, argv)

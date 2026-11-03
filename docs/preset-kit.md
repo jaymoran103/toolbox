@@ -1,6 +1,6 @@
 # The preset kit
 
-`lib/preset_kit.py` is the shared frame for a tool that keeps named presets for one thing and lets you pick one. A preset says which elements show, in what order, and the value of each setting. Every tool on the kit has the same command line, files and keys. Three tools are built on it. `claude-statusline` picks which stats show. `ghostty-config` and `terminal-config` set Ghostty's and macOS Terminal's look and feel.
+`lib/preset_kit.py` is the shared frame for a tool that keeps named presets for one thing and lets you pick one. A preset says which elements show, in what order, and the value of each setting. Every tool on the kit has the same command line, files and keys. Four tools are built on it. `claude-statusline` and `starship-preset` pick which stats and prompt modules show. `ghostty-config` and `terminal-config` set Ghostty's and macOS Terminal's look and feel.
 
 ## What a tool supplies
 
@@ -124,6 +124,6 @@ The theme is a `choice` whose options come from a callable: your themes, then Gh
 
 `bin/terminal-config` does for macOS Terminal what `ghostty-config` does for Ghostty, with the settings Terminal's AppleScript can reach. A preset names a base profile plus changes. With no changes, `applied()` switches to the base profile. With changes, it builds a profile called `toolbox` from the base and the changes. Either way Terminal's default profile, its startup profile and every open tab move to it. AppleScript can't copy a profile's ANSI colours, so `toolbox` keeps Terminal's stock palette. `default` goes back to the profile Terminal used before the tool first ran.
 
-## Next on the kit
+## A fourth example: starship-preset
 
-`starship-preset` predates the kit. Moving it on means one `Tool` subclass, with Starship modules as `show` elements and their styles as `color` elements.
+`bin/starship-preset` picks which Starship modules show, as `show` elements, over a base config: your own, none, or one of Starship's built-in presets. Each built-in becomes a kit preset of its own. `applied()` writes the base with a new top-level `format` to `~/.local/state/starship-preset/active.toml`, and a zsh hook points `STARSHIP_CONFIG` at it before every prompt. With `-H`, the tool overrides `active()` and `set_active()` to keep the pick for one project instead.
