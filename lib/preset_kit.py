@@ -636,7 +636,7 @@ class App:
                 else:
                     self.say(f"not a hex colour: {text}", RED)
             elif e.kind == "choice":
-                if text in e.options():
+                if callable(e.choices) and text or text in e.options():
                     self.set_value(e.key, text)
                 else:
                     self.say(f"not an option: {text}", RED)
@@ -829,8 +829,11 @@ class App:
         if k in ("up", "down") and opts:
             c[3] = (min(c[3], len(opts) - 1) + (1 if k == "down" else -1)) % len(opts)
         elif k == "enter":
+            e = self.t.element(c[0])
             if opts:
                 self.set_value(c[0], opts[min(c[3], len(opts) - 1)])
+            elif callable(e.choices) and c[2].strip():
+                self.set_value(c[0], c[2].strip())     # a name the list doesn't know
             self.choose, self.mode = None, "edit"
         elif k == "esc":
             if c[2]:
@@ -998,6 +1001,9 @@ class App:
         if self.mode == "list":
             return "↑↓ move · enter use · e edit · n new · ? keys"
         if self.mode == "choose":
+            e = self.t.element(self.choose[0])
+            if not self.filtered() and callable(e.choices) and self.choose[2].strip():
+                return f"no match · enter takes '{self.choose[2].strip()}' as typed · esc back"
             return "type to filter · ↑↓ move · enter take · esc back"
         kind, ref = self.erows()[self.ei]
         if kind == "group":

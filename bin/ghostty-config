@@ -105,14 +105,36 @@ def theme_names():
 _fonts = None
 
 
+# SF Mono ships inside Terminal.app, not with the system fonts, so
+# `ghostty +list-fonts` leaves it out. Ghostty still loads it by name.
+APPLE_FONTS = "/System/Applications/Utilities/Terminal.app/Contents/Resources/Fonts"
+
+
+def apple_fonts():
+    try:
+        files = os.listdir(APPLE_FONTS)
+    except OSError:
+        return []
+    names = set()
+    for f in files:
+        base, ext = os.path.splitext(f)
+        if ext.lower() in (".otf", ".ttf") and "italic" not in base.lower():
+            names.add(base.replace("-", " ").replace(" Regular", ""))
+    return sorted(names)
+
+
 def font_names():
+    """Every family Ghostty lists, the SF Mono weights, and the config's own
+    font if it is none of those. The list also takes a typed name."""
     global _fonts
     if _fonts is None:
         try:
             r = subprocess.run(["ghostty", "+list-fonts"], capture_output=True, text=True, timeout=10)
-            _fonts = sorted({ln.strip() for ln in r.stdout.splitlines() if ln and not ln[0].isspace()})
+            listed = {ln.strip() for ln in r.stdout.splitlines() if ln and not ln[0].isspace()}
         except (OSError, subprocess.TimeoutExpired):
-            _fonts = []
+            listed = set()
+        mine = read_config(CONFIG).get("font-family")
+        _fonts = sorted(listed | set(apple_fonts()) | ({mine} if mine else set()), key=str.lower)
     return _fonts
 
 
