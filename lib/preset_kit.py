@@ -11,6 +11,7 @@ docs/preset-kit.md has the contract and two worked examples.
 """
 
 import json
+import math
 import os
 import re
 import select
@@ -79,6 +80,42 @@ def xterm(h):
         SNAPPED[h] = 16 + min(pool, key=lambda i: (LAB256[i][0] - L) ** 2 +
                               (LAB256[i][1] - a) ** 2 + (LAB256[i][2] - b) ** 2)
     return SNAPPED[h]
+
+
+def _linear_rgb(L, C, h):
+    a, b = C * math.cos(math.radians(h)), C * math.sin(math.radians(h))
+    l, m, s = ((L + 0.3963377774 * a + 0.2158037573 * b) ** 3,
+               (L - 0.1055613458 * a - 0.0638541728 * b) ** 3,
+               (L - 0.0894841775 * a - 1.2914855480 * b) ** 3)
+    return (4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+            -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+            -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s)
+
+
+def lch_hex(lightness, strength, hue):
+    """The colour at OKLCH lightness 0-100 and hue in degrees, carrying
+    strength% of the most chroma that hue can show at that lightness, so it
+    never falls out of gamut. hue-pick's full mode uses the same model, so
+    equal lightness steps look equally far apart."""
+    L = max(0.0, min(100.0, lightness)) / 100
+    lo, hi = 0.0, 0.4
+    for _ in range(18):
+        mid = (lo + hi) / 2
+        fits = all(-1e-4 <= v <= 1 + 1e-4 for v in _linear_rgb(L, mid, hue))
+        lo, hi = (mid, hi) if fits else (lo, mid)
+
+    def gamma(v):
+        v = max(0.0, min(1.0, v))
+        return 12.92 * v if v <= 0.0031308 else 1.055 * v ** (1 / 2.4) - 0.055
+    return "#%02x%02x%02x" % tuple(round(gamma(v) * 255) for v in _linear_rgb(L, lo * strength / 100, hue))
+
+
+def ramp(n, first, last):
+    """n lightness steps from first to last, evenly spaced: the linear
+    progression a one-hue theme walks."""
+    if n <= 1:
+        return [float(first)] * n
+    return [first + (last - first) * i / (n - 1) for i in range(n)]
 
 
 def BG(h):

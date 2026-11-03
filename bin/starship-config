@@ -23,7 +23,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
-from preset_kit import DIM, Element, Tool, main  # noqa: E402
+from preset_kit import BG, DIM, Element, Tool, lch_hex, main, ramp  # noqa: E402
 
 HOME = os.path.expanduser("~")
 YOUR_CONFIG = os.path.join(HOME, ".config", "starship.toml")
@@ -101,6 +101,55 @@ def strip_top(text, keys):
     return "\n".join(out) + "\n"
 
 
+# Modules with nothing to colour.
+UNSTYLED = {"line_break", "fill"}
+
+
+def set_keys(text, table, keys):
+    """text with `keys` set inside [table]: an existing line replaced, a
+    missing one added under the heading, a missing table added at the end.
+    Lines inside multi-line strings are left alone."""
+    lines, out, open_q, inside, done = text.splitlines(), [], None, False, set()
+    dropping = False
+    for line in lines:
+        if open_q:
+            if open_q in line:
+                open_q = None
+            if not dropping:
+                out.append(line)
+            continue
+        dropping = False
+        s = line.strip()
+        if s.startswith("["):
+            if inside:
+                blank = 0
+                while out and not out[-1].strip():
+                    out.pop()
+                    blank += 1
+                out += [f"{k} = {v}" for k, v in keys.items() if k not in done] + [""] * blank
+                done.update(keys)
+            inside = s == f"[{table}]"
+            out.append(line)
+            continue
+        m = re.match(r"([A-Za-z0-9_-]+)\s*=\s*(.*)", s)
+        if m:
+            for q in ('"""', "'''"):
+                if m.group(2).startswith(q) and m.group(2).count(q) == 1:
+                    open_q = q
+        if inside and m and m.group(1) in keys:
+            out.append(f"{m.group(1)} = {keys[m.group(1)]}")
+            done.add(m.group(1))
+            dropping = True           # an old multi-line value's lines go with it
+            continue
+        out.append(line)
+    if inside:
+        out += [f"{k} = {v}" for k, v in keys.items() if k not in done]
+        done.update(keys)
+    if not done:
+        out += ["", f"[{table}]"] + [f"{k} = {v}" for k, v in keys.items()]
+    return "\n".join(out) + "\n"
+
+
 # --- the tool -------------------------------------------------------------------
 
 class StarshipPreset(Tool):
@@ -110,6 +159,14 @@ class StarshipPreset(Tool):
     elements = tuple(Element(k, label) for k, label in MODULES) + (
         Element("base", "base config", kind="choice", choices=base_names, optional=True),
         Element("add_newline", "blank line before", kind="choice", choices=("true", "false"), optional=True),
+        # One hue: set a hue, and each shown module takes the next of evenly
+        # spaced OKLCH lightness steps from `lightness first` to `lightness last`.
+        Element("hue", "one hue", kind="number", lo=0, hi=359, step=5, optional=True, default=195,
+                note="unset keeps the base's colours"),
+        Element("strength", "colour strength %", kind="number", lo=0, hi=100, step=5, optional=True, default=70),
+        Element("light-first", "lightness first", kind="number", lo=20, hi=95, step=1, optional=True, default=85),
+        Element("light-last", "lightness last", kind="number", lo=20, hi=95, step=1, optional=True, default=55),
+        Element("bold", "bold", kind="choice", choices=("true", "false"), optional=True),
     )
     builtins = {
         "default": {},
@@ -118,6 +175,8 @@ class StarshipPreset(Tool):
         "full": {"show": ["username", "hostname", "directory", "git_branch", "git_status", "package", "nodejs",
                           "python", "rust", "golang", "cmd_duration", "jobs", "fill", "time", "line_break",
                           "character"]},
+        "one-hue": {"show": ["directory", "git_branch", "git_status", "cmd_duration", "character"],
+                    "set": {"hue": 195, "strength": 70, "light-first": 85, "light-last": 55, "bold": "true"}},
     }
     builtins.update({n: {"set": {"base": n}} for n in (run("starship", "preset", "--list") or "").split()})
     scope = None          # a project folder, under -H
@@ -180,7 +239,30 @@ class StarshipPreset(Tool):
             head += 'format = "' + "".join(f"${m}" for m in show) + '"\n'
         if s.get("add_newline"):
             head += f"add_newline = {s['add_newline']}\n"
-        return head + strip_top(base, drop) if drop else head + base
+        text = head + strip_top(base, drop) if drop else head + base
+        for module, keys in self.styles(preset).items():
+            text = set_keys(text, module, keys)
+        return text
+
+    def steps(self, preset):
+        """(module, hex) for each shown module that takes a colour, in order."""
+        s = preset["set"]
+        if s.get("hue") is None:
+            return []
+        mods = [m for m in preset["show"] if m not in UNSTYLED]
+        val = lambda k: s.get(k) if s.get(k) is not None else self.element(k).default
+        lights = ramp(len(mods), val("light-first"), val("light-last"))
+        return [(m, lch_hex(L, val("strength"), s["hue"])) for m, L in zip(mods, lights)]
+
+    def styles(self, preset):
+        weight = "" if preset["set"].get("bold") == "false" else "bold "
+        out = {}
+        for m, colour in self.steps(preset):
+            if m == "character":
+                out[m] = {"success_symbol": f'"[❯]({weight}{colour})"'}
+            else:
+                out[m] = {"style": f'"{weight}{colour}"'}
+        return out
 
     def applied(self, name, preset):
         if self.scope:
@@ -239,6 +321,10 @@ class StarshipPreset(Tool):
             base = preset["set"].get("base") or "your config"
             out.append(DIM + f"base: {base}" + (" · your module order" if preset["show"] else " · its own order")
                        + "\x1b[0m")
+            steps = self.steps(preset)
+            if steps:
+                out += ["", DIM + f"one hue · {preset['set']['hue']}°, lightness steps first to last\x1b[0m"]
+                out += [f"{BG(c)}    \x1b[0m {m:<14} {c}" for m, c in steps]
             self._rendered[mark] = out
         return self._rendered[mark]
 

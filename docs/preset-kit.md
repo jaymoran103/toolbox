@@ -62,7 +62,9 @@ All optional. The kit calls them, and a tool overrides the ones it needs.
 
 ## Colour
 
-`BG(hex)` and `FG(hex)` give a tool's `render()` its colours. They draw in full colour when `COLORTERM` says the terminal has it, and as the nearest xterm-256 colour otherwise, matched as `color-pick` matches. `PRESET_KIT_COLOURS=full` or `256` overrides the guess. Older macOS Terminal has no full colour, so a tool that draws with these still reads right there.
+`BG(hex)` and `FG(hex)` give a tool's `render()` its colours. They draw in full colour when `COLORTERM` says the terminal has it, and as the nearest xterm-256 colour otherwise, matched as `color-pick` matches. `PRESET_KIT_COLOURS=full` or `256` overrides the guess.
+
+`lch_hex(lightness, strength, hue)` makes a colour in OKLCH: lightness 0 to 100, hue in degrees, and strength as a percent of the most chroma that hue can show at that lightness, so it never leaves the gamut. `ramp(n, first, last)` gives n evenly spaced lightness steps. Together they make a one-hue theme whose progression is plain arithmetic. Older macOS Terminal has no full colour, so a tool that draws with these still reads right there.
 
 `pickup` is what the footer says when a preset goes into use. `list_shows = False` drops the list of shown elements under the preview.
 
@@ -132,4 +134,4 @@ The theme is a `choice` whose options come from a callable: your themes, then Gh
 
 ## A fourth example: starship-config
 
-`bin/starship-config` picks which Starship modules show, as `show` elements, over a base config: your own, none, or one of Starship's built-in presets. Each built-in becomes a kit preset of its own. `applied()` writes the base with a new top-level `format` to `~/.local/state/starship-config/active.toml`, and a zsh hook points `STARSHIP_CONFIG` at it before every prompt. With `-H`, the tool overrides `active()`, `set_active()` and `draft_path` to keep the pick and its unsaved changes for one project instead.
+`bin/starship-config` picks which Starship modules show, as `show` elements, over a base config: your own, none, or one of Starship's built-in presets. Each built-in becomes a kit preset of its own. `applied()` writes the base with a new top-level `format` to `~/.local/state/starship-config/active.toml`, and a zsh hook points `STARSHIP_CONFIG` at it before every prompt. Setting `hue` turns on a one-hue theme: each shown module, in order, takes the next of `ramp(n, lightness first, lightness last)` at that hue and strength, written into its table's `style`. The `one-hue` preset starts from your config's modules. With `-H`, the tool overrides `active()`, `set_active()` and `draft_path` to keep the pick and its unsaved changes for one project instead.
