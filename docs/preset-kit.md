@@ -1,6 +1,6 @@
 # The preset kit
 
-`lib/preset_kit.py` is the shared frame for a tool that keeps named presets for one thing and lets you pick one. A preset says which elements show, in what order, and the value of each setting. Every tool on the kit has the same command line, files and keys. Four tools are built on it. `claude-statusline` and `starship-preset` pick which stats and prompt modules show. `ghostty-config` and `terminal-config` set Ghostty's and macOS Terminal's look and feel.
+`lib/preset_kit.py` is the shared frame for a tool that keeps named presets for one thing and lets you pick one. A preset says which elements show, in what order, and the value of each setting. Every tool on the kit has the same command line, files and keys. Four tools are built on it. `statusline-config` and `starship-config` pick which stats and prompt modules show. `ghostty-config` and `terminal-config` set Ghostty's and macOS Terminal's look and feel.
 
 ## What a tool supplies
 
@@ -70,14 +70,19 @@ All optional. The kit calls them, and a tool overrides the ones it needs.
 
 | | |
 | --- | --- |
-| `tool` | the picker and editor, in a terminal |
+| `tool` | the menu: presets, editor and preview |
 | `tool <preset>` | use a preset |
+| `tool <setting> [value]` | show or change one setting of the preset in use, as `ghostty-config theme roboswag` |
+| `tool -s` | save changes into the preset in use |
+| `tool -S NAME` | save changes as a new preset and use it |
+| `tool -d` | drop unsaved changes |
 | `tool -l` | list presets, `•` on the one in use |
-| `tool -s` | the preset in use, and where it comes from |
+| `tool --status` | the preset in use, and whether it has changes |
 | `tool -r` | back to the default |
 | `tool --print [p]` | draw a preset, or the one in use |
-| `tool --save NAME` | keep the preset in use as NAME |
-| exit code | 0 done, 1 unknown preset or bad name, 2 usage error |
+| exit code | 0 done, 1 unknown preset, setting or value, 2 usage error |
+
+A change, from the menu or the command line, applies at once and stays unsaved until `s` or `S`. Unsaved changes live in `~/.local/state/<tool>/draft.json`, so closing the menu keeps them. Switching to another preset with changes open asks twice. A setting is found by its key, its label with dashes, or one of its `aliases`. `Element.parse()` turns typed text into a value and explains a bad one.
 
 ## Files
 
@@ -91,17 +96,18 @@ A preset of yours with a built-in's name hides it, and the list calls it `change
 
 ## Keys
 
-Three screens. The preset list draws the hovered preset on the right. The editor lists every element, shown ones first in order, under folding group headings when the tool has groups. A long choice opens a list you filter by typing, and the preview follows the hovered option. Edits save as you make them, so `esc` only goes back. Undo all and delete are armed: `⌫` once says what goes, and `⌫` again does it.
+Three screens. The preset list draws the hovered preset on the right. The editor lists every element, shown ones first in order, under folding group headings when the tool has groups. A long choice opens a list you filter by typing, and the preview follows the hovered option. `e` makes the hovered preset the one in use and opens it. Edits apply at once and stay unsaved until `s` saves them into the preset or `S` saves them as a new one, so `esc` only goes back. Dropping changes, deleting and switching away from unsaved changes are armed: the first press says what goes, and the second does it.
 
 | list | | editor | |
 | --- | --- | --- | --- |
 | `enter` | use it | `space` | show or hide |
-| `e` `→` | edit | `←→` | change a setting |
+| `e` `→` | use and edit | `←→` | change a setting |
 | `n` | new from this | `⇧↑↓` `K` `J` | reorder |
 | `⌫ ⌫` | delete yours | `z` `y` | undo, redo |
-| `q` `esc` | quit | `⌫ ⌫` | undo all |
+| `q` `esc` | quit | `⌫ ⌫` | drop changes |
 | `?` | keys | `esc` `←` | back |
-| | | `x` | unset |
+| `s` | save changes | `x` | unset |
+| `S` | save as new | `s` `S` | save, save as |
 | | | `-` `+` | fold all, open all |
 
 ## The worked example: claude-statusline
@@ -124,6 +130,6 @@ The theme is a `choice` whose options come from a callable: your themes, then Gh
 
 `bin/terminal-config` does for macOS Terminal what `ghostty-config` does for Ghostty, with the settings Terminal's AppleScript can reach. A preset names a base profile plus changes. With no changes, `applied()` switches to the base profile. With changes, it builds a profile called `toolbox` from the base and the changes. Either way Terminal's default profile, its startup profile and every open tab move to it. AppleScript can't copy a profile's ANSI colours, so `toolbox` keeps Terminal's stock palette. `default` goes back to the profile Terminal used before the tool first ran.
 
-## A fourth example: starship-preset
+## A fourth example: starship-config
 
-`bin/starship-preset` picks which Starship modules show, as `show` elements, over a base config: your own, none, or one of Starship's built-in presets. Each built-in becomes a kit preset of its own. `applied()` writes the base with a new top-level `format` to `~/.local/state/starship-preset/active.toml`, and a zsh hook points `STARSHIP_CONFIG` at it before every prompt. With `-H`, the tool overrides `active()` and `set_active()` to keep the pick for one project instead.
+`bin/starship-config` picks which Starship modules show, as `show` elements, over a base config: your own, none, or one of Starship's built-in presets. Each built-in becomes a kit preset of its own. `applied()` writes the base with a new top-level `format` to `~/.local/state/starship-config/active.toml`, and a zsh hook points `STARSHIP_CONFIG` at it before every prompt. With `-H`, the tool overrides `active()`, `set_active()` and `draft_path` to keep the pick and its unsaved changes for one project instead.

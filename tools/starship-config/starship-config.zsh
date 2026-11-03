@@ -1,9 +1,9 @@
-# starship-preset — point Starship at the config picked for this directory.
-# bin/starship-preset writes the picks. This reads them before every prompt,
+# starship-config — point Starship at the config picked for this directory.
+# bin/starship-config writes the picks. This reads them before every prompt,
 # with no forks, so every open shell follows a new pick on its next prompt.
 # A project pick (longest matching dir) beats the everywhere pick.
 
-_starship_preset_state="${XDG_STATE_HOME:-$HOME/.local/state}/starship-preset"
+_starship_preset_state="${XDG_STATE_HOME:-$HOME/.local/state}/starship-config"
 
 _starship_preset_pick() {
   local dir p f best= bestdir=

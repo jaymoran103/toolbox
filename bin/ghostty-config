@@ -192,7 +192,7 @@ class GhosttyConfig(Tool):
         el("unfocused-split-opacity", "unfocused split", "Theme", "number",
            lo=0.15, hi=1, step=0.05, default=0.7),
         el("minimum-contrast", "minimum contrast", "Theme", "number", lo=1, hi=21, step=0.5, default=1),
-        el("font-family", "family", "Font", "choice", choices=font_names),
+        el("font-family", "family", "Font", "choice", choices=font_names, aliases=("font",)),
         el("font-size", "size", "Font", "number", lo=6, hi=36, step=0.5, default=13),
         el("font-thicken", "thicken", "Font", "choice", choices=TF),
         el("adjust-cell-height", "cell height", "Font", "choice",

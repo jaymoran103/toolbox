@@ -1,0 +1,12 @@
+{
+  "name": "tools",
+  "about": "one door to every tool: a menu, shortcuts, links and a packed build",
+  "template": "none",
+  "entries": [
+    "bin/tools"
+  ],
+  "links": {},
+  "needs": [
+    "python3"
+  ]
+}

@@ -14,5 +14,11 @@
     "python3",
     "ghostty",
     "fzf"
-  ]
+  ],
+  "shortcuts": {
+    "theme": "ghostty-config theme",
+    "font": "ghostty-config font-family",
+    "font-size": "ghostty-config font-size",
+    "opacity": "ghostty-config background-opacity"
+  }
 }

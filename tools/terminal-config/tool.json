@@ -11,5 +11,6 @@
   "needs": [
     "python3",
     "osascript"
-  ]
+  ],
+  "shortcuts": {}
 }

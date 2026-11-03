@@ -1,6 +1,16 @@
 # toolbox
 
-Terminal tools built on shared templates. Clone it, run `./install.sh`, and each tool lands on your PATH.
+Terminal tools built on shared templates. Clone it, run `./install.sh`, and each tool lands on your PATH. `tools` opens a menu of all of them.
+
+```sh
+tools                      # a menu of every tool
+tools theme roboswag       # a shortcut: set Ghostty's theme in the config in use
+ghostty-config -s          # save that change into the config in use
+ghostty-config -S night    # or save it as a new config
+tools build                # pack the whole toolbox into one file, dist/tools
+```
+
+The packed file runs anywhere `python3` does. Copy it over, run `./tools link`, and every command is on your PATH.
 
 ```sh
 git clone https://github.com/jaymoran103/toolbox.git ~/.toolbox

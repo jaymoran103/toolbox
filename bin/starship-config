@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""starship-preset — what your Starship prompt shows, kept as presets.
+"""starship-config — what your Starship prompt shows, kept as presets.
 
 A preset starts from a base config and picks which modules show, in what
 order. The base is your own config, no config, or one of Starship's
@@ -7,13 +7,13 @@ built-in presets, and it gives the modules their look. The preview draws
 the real prompt for the directory you started in, and each module's row
 shows what it prints there.
 
-Using a preset writes ~/.local/state/starship-preset/active.toml. The zsh
-hook, tools/starship-preset/starship-preset.zsh, points STARSHIP_CONFIG at
+Using a preset writes ~/.local/state/starship-config/active.toml. The zsh
+hook, tools/starship-config/starship-config.zsh, points STARSHIP_CONFIG at
 it before every prompt, so open shells switch on their next prompt.
 
-  starship-preset -H [preset]   pick for this project only: the git top
-                                level, or this folder. It beats the
-                                everywhere pick, and -H -r drops it.
+  starship-config -H ...   the same commands, for this project only: the git
+                           top level, or this folder. A project pick beats
+                           the everywhere pick, and -H -r drops it.
 """
 
 import json
@@ -104,7 +104,7 @@ def strip_top(text, keys):
 # --- the tool -------------------------------------------------------------------
 
 class StarshipPreset(Tool):
-    name = "starship-preset"
+    name = "starship-config"
     title = "what your Starship prompt shows"
     pickup = "open shells switch on their next prompt"
     elements = tuple(Element(k, label) for k, label in MODULES) + (
@@ -139,6 +139,15 @@ class StarshipPreset(Tool):
         with open(self.file(name), "w") as f:
             f.writelines("\t".join(r) + "\n" for r in rows)
 
+    @property
+    def draft_path(self):
+        if self.scope:
+            return self.file("draft-" + self.slug() + ".json")
+        return super().draft_path
+
+    def slug(self):
+        return re.sub(r"[^A-Za-z0-9]+", "-", self.scope).strip("-")
+
     def active(self):
         if self.scope:
             mine = dict(self.read_lines("project-picks")).get(self.scope)
@@ -149,21 +158,16 @@ class StarshipPreset(Tool):
     def set_active(self, name):
         if not self.scope:
             return super().set_active(name)
-        picks = [r for r in self.read_lines("project-picks") if r[0] != self.scope]
-        paths = [r for r in self.read_lines("projects") if r[0] != self.scope]
-        if name != self.default:
-            picks.append([self.scope, name])
-            paths.append([self.scope, self.config_file(name, self.load(name))])
-        self.write_lines("project-picks", picks)
-        self.write_lines("projects", paths)
+        self.drop_draft()
+        self.applied(name, self.load(name))
 
     def config_file(self, name, preset):
         """Write the preset's config and return its path."""
-        slug = "active" if not self.scope else "project-" + re.sub(r"[^A-Za-z0-9]+", "-", self.scope).strip("-")
+        slug = "active" if not self.scope else "project-" + self.slug()
         path = self.file(slug + ".toml")
         os.makedirs(self.state_dir, exist_ok=True)
         with open(path, "w") as f:
-            f.write(f"# Written by starship-preset from preset {name}. Edit the preset, not this file.\n")
+            f.write(f"# Written by starship-config from preset {name}. Edit the preset, not this file.\n")
             f.write(self.text(preset))
         return path
 
@@ -180,7 +184,13 @@ class StarshipPreset(Tool):
 
     def applied(self, name, preset):
         if self.scope:
-            self.set_active(name)
+            picks = [r for r in self.read_lines("project-picks") if r[0] != self.scope]
+            paths = [r for r in self.read_lines("projects") if r[0] != self.scope]
+            if name != self.default or preset != self.load(name):
+                picks.append([self.scope, name])
+                paths.append([self.scope, self.config_file(name, preset)])
+            self.write_lines("project-picks", picks)
+            self.write_lines("projects", paths)
             return
         path = self.file("global")
         if name == self.default and not preset["show"] and not any(preset["set"].values()):

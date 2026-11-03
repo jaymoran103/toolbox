@@ -1,0 +1,19 @@
+{
+  "name": "starship-config",
+  "about": "what your Starship prompt shows, everywhere or per project",
+  "template": "preset-kit",
+  "entries": [
+    "bin/starship-config"
+  ],
+  "links": {
+    "presets/starship-config": "~/.config/starship-config/presets",
+    "tools/starship-config/starship-config.zsh": "~/.config/starship/starship-preset.zsh"
+  },
+  "needs": [
+    "python3",
+    "starship"
+  ],
+  "shortcuts": {
+    "prompt": "starship-config"
+  }
+}

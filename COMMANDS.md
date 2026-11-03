@@ -2,10 +2,11 @@
 
 | Command | Utility | Best argument combo |
 | --- | --- | --- |
+| `tools` | One door to every tool: a menu, shortcuts, links and a packed build | `tools theme roboswag` |
 | `ghostty-config` | Ghostty's theme, font, window, cursor and keys as presets | `ghostty-config` |
 | `terminal-config` | macOS Terminal's profile, font, colours and size as presets | `terminal-config` |
-| `claude-statusline` | Pick which stats Claude Code's status line shows | `claude-statusline` |
-| `starship-preset` | Pick what your Starship prompt shows, everywhere or per project | `starship-preset -H` |
+| `statusline-config` | Pick which stats Claude Code's status line shows; Claude runs it as `claude-statusline` | `statusline-config` |
+| `starship-config` | Pick what your Starship prompt shows, everywhere or per project | `starship-config -H` |
 | `color-pick` | Pick one colour, get its hex | `color-pick -f hex` |
 | `tt` | Menu of time-tool presets; also `stopwatch`, `timer`, `metronome`, `counter`, `fireworks` | `timer 25m focus --view big` |
 | `icons-batch` | One DiceBear blob icon PNG per seed; needs Node | `icons-batch alpha beta gamma` |

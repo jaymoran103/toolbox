@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""tools — one door to every tool in the toolbox.
+
+  tools                      a menu of every tool; enter opens one
+  tools <tool> [args]        run a tool, by command or short name
+  tools <shortcut> [args]    a manifest shortcut, as in `tools theme roboswag`
+  tools -l                   every tool, with its commands and shortcuts
+  tools link [DIR]           put every command on PATH, in DIR or ~/.local/bin
+  tools build [FILE]         pack the toolbox into one runnable file, dist/tools
+
+Tools, commands and shortcuts come from tools/<tool>/tool.json. A short
+name drops -config or -pick: `tools ghostty` opens ghostty-config.
+"""
+
+import glob
+import json
+import os
+import select
+import shutil
+import subprocess
+import sys
+import tempfile
+import termios
+import tty
+import zipapp
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "lib"))
+from preset_kit import BOLD, DIM, GREEN, REV, Canvas, box, keys  # noqa: E402
+
+HOME = os.path.expanduser("~")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "toolbox")
+DIST = os.environ.get("TOOLBOX_DIST")    # set when running from a packed file
+
+
+def die(msg, code=1):
+    sys.stderr.write(f"tools: {msg}\n")
+    sys.exit(code)
+
+
+# --- what the manifests say -----------------------------------------------------
+
+def manifests():
+    out = []
+    for path in sorted(glob.glob(os.path.join(ROOT, "tools", "*", "tool.json"))):
+        with open(path) as f:
+            out.append(json.load(f))
+    return out
+
+
+def commands(m):
+    """(command, path) for each entry, "path as name" included."""
+    out = []
+    for e in m.get("entries", []):
+        path, _, name = e.partition(" as ")
+        out.append((name or os.path.basename(path), os.path.join(ROOT, path)))
+    return out
+
+
+def short(name):
+    for tail in ("-config", "-pick", "-preset"):
+        if name.endswith(tail):
+            return name[:-len(tail)]
+    return name
+
+
+def resolve(word):
+    """(command, path, leading args) for a command, short name or shortcut."""
+    ms = manifests()
+    for m in ms:
+        for name, path in commands(m):
+            if word in (name, short(name)):
+                return name, path, []
+    for m in ms:
+        if word in m.get("shortcuts", {}):
+            first, *rest = m["shortcuts"][word].split()
+            name, path, _ = resolve(first)
+            return name, path, rest
+    return None
+
+
+def run(name, path, args):
+    """exec the command under its own name. A tool that reads its name, such
+    as tt, runs through a symlink of that name."""
+    if os.path.basename(path) != name:
+        links = os.path.join(CACHE, "links", os.path.basename(ROOT.rstrip("/")) + "-" + str(abs(hash(ROOT)) % 10**8))
+        os.makedirs(links, exist_ok=True)
+        link = os.path.join(links, name)
+        if os.path.realpath(link) != os.path.realpath(path):
+            if os.path.lexists(link):
+                os.remove(link)
+            os.symlink(path, link)
+        path = link
+    os.execv(path, [name] + args)
+
+
+# --- tools -l, link, build ---------------------------------------------------------
+
+def listing():
+    for m in manifests():
+        names = [n for n, _ in commands(m)]
+        print(f"{BOLD if sys.stdout.isatty() else ''}{m['name']}\x1b[0m  {m['about']}"
+              if sys.stdout.isatty() else f"{m['name']}  {m['about']}")
+        print(f"  commands   {', '.join(names)}")
+        for s, target in m.get("shortcuts", {}).items():
+            print(f"  shortcut   tools {s} …  →  {target} …")
+
+
+def link(dest):
+    """Each command on PATH. From a checkout, a symlink to the script. From a
+    packed file, a two-line wrapper that calls it, so a rebuild needs no
+    relink."""
+    os.makedirs(dest, exist_ok=True)
+    for m in manifests():
+        for name, path in commands(m):
+            target = os.path.join(dest, name)
+            if os.path.lexists(target):
+                if not os.path.islink(target) and not DIST:
+                    print(f"  skipped   {target}: a real file is there")
+                    continue
+                os.remove(target)
+            if DIST:
+                with open(target, "w") as f:
+                    f.write(f'#!/bin/sh\nexec "{DIST}" {name} "$@"\n')
+                os.chmod(target, 0o755)
+            elif os.path.basename(path) == name:
+                os.symlink(path, target)
+            else:
+                os.symlink(path, target)
+            print(f"  linked    {target.replace(HOME, '~', 1)}")
+
+
+MAIN = '''\
+"""A packed toolbox. It unpacks itself once into ~/.cache/toolbox/<hash>/,
+then runs bin/tools there with the same arguments."""
+import hashlib, os, shutil, sys, tempfile, zipfile
+
+ARCHIVE = os.path.dirname(os.path.abspath(__file__))
+with open(ARCHIVE, "rb") as f:
+    digest = hashlib.sha256(f.read()).hexdigest()[:12]
+base = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "toolbox")
+home = os.path.join(base, digest)
+if not os.path.isdir(home):
+    os.makedirs(base, exist_ok=True)
+    tmp = tempfile.mkdtemp(dir=base)
+    with zipfile.ZipFile(ARCHIVE) as z:
+        for info in z.infolist():
+            if info.filename == "__main__.py":
+                continue
+            path = z.extract(info, tmp)
+            mode = info.external_attr >> 16 & 0o777
+            if mode:
+                os.chmod(path, mode)
+    try:
+        os.rename(tmp, home)
+    except OSError:
+        shutil.rmtree(tmp, ignore_errors=True)     # another run unpacked it first
+os.environ["TOOLBOX_DIST"] = ARCHIVE
+entry = os.path.join(home, "bin", "tools")
+os.execv(entry, [entry] + sys.argv[1:])
+'''
+PACK = ("bin", "lib", "tools", "config", "COMMANDS.md", "README.md")
+
+
+def build(target):
+    """One file holding every tool, runnable wherever python3 is."""
+    if DIST:
+        die("build from a checkout, not from a packed file")
+    stage = tempfile.mkdtemp()
+    try:
+        for part in PACK:
+            src = os.path.join(ROOT, part)
+            if os.path.isdir(src):
+                shutil.copytree(src, os.path.join(stage, part), symlinks=False,
+                                ignore=shutil.ignore_patterns("__pycache__", ".DS_Store", "*.tmp"))
+            elif os.path.exists(src):
+                shutil.copy2(src, stage)
+        with open(os.path.join(stage, "__main__.py"), "w") as f:
+            f.write(MAIN)
+        os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
+        zipapp.create_archive(stage, target, interpreter="/usr/bin/env python3")
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    n = sum(len(commands(m)) for m in manifests())
+    print(f"built {target.replace(HOME, '~', 1)} · {os.path.getsize(target) // 1024} KB · {n} commands")
+    print(f"  run       {target} <tool>   or   {target} link")
+
+
+# --- the menu --------------------------------------------------------------------
+
+class Menu:
+    def __init__(self):
+        self.tools = manifests()
+        self.i = self.off = 0
+        self.helps = {}
+        self.tty = os.open("/dev/tty", os.O_RDWR)
+        self.chosen = None
+
+    def out(self, s):
+        os.write(self.tty, s.encode())
+
+    def help_of(self, m):
+        if m["name"] not in self.helps:
+            name, path = commands(m)[0]
+            try:
+                r = subprocess.run([path, "-h"], capture_output=True, text=True, timeout=5,
+                                   stdin=subprocess.DEVNULL)
+                text = r.stdout or r.stderr
+            except (OSError, subprocess.TimeoutExpired):
+                text = ""
+            self.helps[m["name"]] = text.strip("\n").splitlines()
+        return self.helps[m["name"]]
+
+    def draw(self):
+        tw, th = os.get_terminal_size(self.tty)
+        w, h = min(tw, 120), min(th, 40)
+        c = Canvas(w, h)
+        lw = max(28, min(36, w // 3))
+        c.put(0, 1, "tools", BOLD)
+        c.put(0, 8, "every tool in the toolbox" + (" · packed" if DIST else ""), DIM)
+        box(c, 1, 0, lw, h - 2, "tools", True)
+        box(c, 1, lw, w - lw, h - 2, "about", False)
+        rows = h - 4
+        self.off = max(min(self.off, self.i), self.i - rows + 1)
+        for r, m in enumerate(self.tools[self.off:self.off + rows]):
+            on = self.off + r == self.i
+            c.put(2 + r, 2, m["name"].ljust(lw - 4), REV if on else "")
+        m = self.tools[self.i]
+        x, pw = lw + 2, w - lw - 4
+        c.put(2, x, m["about"], BOLD, limit=pw)
+        c.put(3, x, "commands  " + ", ".join(n for n, _ in commands(m)), DIM, limit=pw)
+        y = 4
+        for s, target in m.get("shortcuts", {}).items():
+            c.put(y, x, f"tools {s} …", GREEN, limit=pw)
+            c.put(y, x + 20, f"→ {target} …", DIM, limit=pw - 20)
+            y += 1
+        y += 1
+        for line in self.help_of(m)[:h - 3 - y]:
+            c.put(y, x, line, limit=pw)
+            y += 1
+        c.put(h - 1, 1, "↑↓ move · enter open · q quit · tools <name> opens one directly", DIM, limit=w - 2)
+        canvas = c.centred(tw, th) if (tw, th) != (w, h) else c
+        self.out(canvas.render())
+
+    def run(self):
+        old = termios.tcgetattr(self.tty)
+        self.out("\x1b[?1049h\x1b[?25l\x1b[?7l")
+        tty.setraw(self.tty)
+        try:
+            done, size = False, None
+            while not done:
+                now = os.get_terminal_size(self.tty)
+                if now != size:
+                    self.draw()
+                    size = now
+                if select.select([self.tty], [], [], 0.25)[0]:
+                    for k in keys(os.read(self.tty, 1024)):
+                        k = {"k": "up", "j": "down"}.get(k, k)
+                        if k in ("up", "down"):
+                            self.i = (self.i + (1 if k == "down" else -1)) % len(self.tools)
+                        elif k in ("enter", "right"):
+                            self.chosen, done = self.tools[self.i], True
+                        elif k in ("q", "esc", "ctrl-c"):
+                            done = True
+                        if done:
+                            break
+                    self.draw()
+        finally:
+            termios.tcsetattr(self.tty, termios.TCSADRAIN, old)
+            self.out("\x1b[?7h\x1b[?25h\x1b[?1049l")
+            os.close(self.tty)
+        if self.chosen:
+            name, path = commands(self.chosen)[0]
+            run(name, path, [])
+
+
+def main(argv):
+    a = argv[0] if argv else None
+    if a in ("-h", "--help"):
+        print(__doc__.strip())
+    elif a in ("-l", "--list"):
+        listing()
+    elif a == "link":
+        link(os.path.expanduser(argv[1]) if len(argv) > 1 else os.path.join(HOME, ".local", "bin"))
+    elif a == "build":
+        build(argv[1] if len(argv) > 1 else os.path.join(ROOT, "dist", "tools"))
+    elif a:
+        hit = resolve(a) or die(f"no tool or shortcut '{a}' (try tools -l)")
+        name, path, lead = hit
+        run(name, path, lead + argv[1:])
+    else:
+        if not os.isatty(sys.stdout.fileno()):
+            die("the menu needs a terminal; tools -l lists every tool", 2)
+        Menu().run()
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

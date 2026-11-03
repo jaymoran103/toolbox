@@ -3,7 +3,8 @@
   "about": "which stats Claude Code's status line shows",
   "template": "preset-kit",
   "entries": [
-    "bin/claude-statusline"
+    "bin/claude-statusline",
+    "bin/claude-statusline as statusline-config"
   ],
   "links": {
     "presets/claude-statusline": "~/.config/claude-statusline/presets"
@@ -11,5 +12,8 @@
   "needs": [
     "python3",
     "git"
-  ]
+  ],
+  "shortcuts": {
+    "statusline": "statusline-config"
+  }
 }

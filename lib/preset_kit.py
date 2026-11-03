@@ -108,11 +108,11 @@ class Element:
     """
 
     def __init__(self, key, label, kind="show", choices=(), group="", optional=False,
-                 default=None, lo=0, hi=100, step=1, note="", actions=None):
+                 default=None, lo=0, hi=100, step=1, note="", actions=None, aliases=()):
         self.key, self.label, self.kind, self.group = key, label, kind, group
         self.choices, self.optional, self.default = choices, optional, default
         self.lo, self.hi, self.step, self.note = lo, hi, step, note
-        self.actions = actions or {}
+        self.actions, self.aliases = actions or {}, tuple(aliases)
 
     def options(self):
         return list(self.choices() if callable(self.choices) else self.choices)
@@ -137,8 +137,44 @@ class Element:
         return isinstance(v, str)
 
     def number(self, v):
-        v = max(self.lo, min(self.hi, round(v / self.step) * self.step))
-        return int(v) if float(self.step).is_integer() else round(v, 4)
+        v = round(max(self.lo, min(self.hi, round(v / self.step) * self.step)), 4)
+        return int(v) if float(v).is_integer() else v
+
+    def parse(self, text):
+        """A value typed on the command line or in a prompt. Raises
+        ValueError with a reason a person can read."""
+        raw, text = text, text.strip()
+        if self.kind == "choice" and not callable(self.choices):
+            # A separator such as " | " keeps its spaces; a bare "|" finds it too.
+            hit = [c for c in self.choices if raw == c or text == str(c).strip()]
+            if hit:
+                return hit[0]
+        if self.kind == "show":
+            if text.lower() in ("on", "yes", "true", "show", "+"):
+                return True
+            if text.lower() in ("off", "no", "false", "hide", "-"):
+                return False
+            raise ValueError(f"{self.label} takes on or off")
+        if text.lower() in ("unset", "-", ""):
+            if self.optional:
+                return None
+            raise ValueError(f"{self.label} always has a value")
+        if self.kind == "number":
+            try:
+                v = float(text)
+            except ValueError:
+                v = None
+            if v is None or not self.lo <= v <= self.hi:
+                raise ValueError(f"{self.label} takes a number from {self.lo} to {self.hi}")
+            return self.number(v)
+        if self.kind == "color":
+            v = (text if text.startswith("#") else "#" + text).lower()
+            if not HEX.fullmatch(v):
+                raise ValueError(f"not a hex colour: {text}")
+            return v
+        if self.kind == "choice" and not callable(self.choices) and text not in self.choices:
+            raise ValueError(f"{self.label} takes one of: " + ", ".join(map(str, self.choices)))
+        return text
 
 
 class Tool:
@@ -233,7 +269,8 @@ class Tool:
         for e in self.elements:
             if e.kind != "show":
                 v = sets.get(e.key)
-                out[e.key] = v if e.valid(v) else e.fallback()
+                v = v if e.valid(v) else e.fallback()
+                out[e.key] = e.number(v) if e.kind == "number" and v is not None else v
         return {"show": list(dict.fromkeys(show)), "set": out}
 
     def save(self, name, preset):
@@ -271,10 +308,69 @@ class Tool:
         else:
             with open(pick, "w") as f:
                 f.write(name + "\n")
+        self.drop_draft()
         self.applied(name, self.load(name))
 
+    def find(self, word):
+        """An element by its key, an alias, or its label with dashes."""
+        w = word.lower()
+        for e in self.elements:
+            if w in (e.key.lower(), e.label.lower().replace(" ", "-")) or w in e.aliases:
+                return e
+        return None
+
+    # --- unsaved changes --------------------------------------------------------
+    # Changes go to a draft of the preset in use. The draft is used at once,
+    # as if saved, but the preset's file stays as it was until a save: `s`
+    # saves into the preset, `S` saves as a new one. Switching presets with a
+    # draft open is armed, so nothing goes unless you say so.
+
+    @property
+    def draft_path(self):
+        return os.path.join(self.state_dir, "draft.json")
+
+    def draft(self):
+        try:
+            with open(self.draft_path) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            return None
+        return self.clean(d["preset"]) if d.get("of") == self.active() else None
+
+    def set_draft(self, preset):
+        if preset == self.load(self.active()):
+            self.drop_draft()
+        else:
+            os.makedirs(self.state_dir, exist_ok=True)
+            with open(self.draft_path, "w") as f:
+                json.dump({"of": self.active(), "preset": preset}, f, indent=2)
+        self.applied(self.active(), self.active_preset())
+
+    def drop_draft(self):
+        try:
+            os.remove(self.draft_path)
+        except OSError:
+            pass
+
+    def save_draft(self):
+        """Save the draft into the preset in use. A built-in becomes a changed
+        copy of yours, and a copy back to the built-in drops the file."""
+        name, preset = self.active(), self.active_preset()
+        if name in self.builtins and preset == self.clean(self.builtins[name]):
+            self.delete(name)
+        else:
+            self.save(name, preset)
+        self.drop_draft()
+        return name
+
+    def save_as(self, name):
+        self.save(name, self.active_preset())
+        self.drop_draft()
+        self.set_active(name)
+
     def active_preset(self):
-        return self.load(self.active()) or self.clean(self.builtins[self.default])
+        return (self.draft() or self.load(self.active())
+                or self.clean(self.builtins[self.default]))
 
 
 def sibling(name):
@@ -286,55 +382,103 @@ def sibling(name):
 # --- the command line ---------------------------------------------------------
 
 USAGE = """\
-  {n}               picker and editor
-  {n} <preset>      use <preset>
-  {n} -l            list presets
-  {n} -s            say which preset is in use
-  {n} -r            go back to {d}
-  {n} --print [p]   draw a preset, or the one in use
-  {n} --save NAME   keep the preset in use as NAME"""
+  {n}                    the menu: presets, editor and preview
+  {n} <preset>           use <preset>
+  {n} <setting> [value]  show or change one setting of the preset in use
+  {n} -s                 save changes into the preset in use
+  {n} -S NAME            save changes as a new preset, NAME, and use it
+  {n} -d                 drop unsaved changes
+  {n} -l                 list presets
+  {n} --status           the preset in use, and whether it has changes
+  {n} -r                 go back to {d}
+  {n} --print [preset]   draw a preset, or the one in use
+
+A change applies at once and stays unsaved until -s or -S."""
 
 
 def main(tool, argv):
-    """Exit 0 done, 1 unknown preset or bad name, 2 usage error."""
+    """Exit 0 done, 1 unknown preset, setting or value, 2 usage error."""
     def die(msg, code=1):
         sys.stderr.write(f"{tool.name}: {msg}\n")
         sys.exit(code)
 
+    def unsaved():
+        return f"unsaved changes to {tool.active()} · -s saves, -S NAME saves as, -d drops them"
+
     a = argv[0] if argv else None
     if a in ("-h", "--help"):
         print(f"{tool.name} — {tool.title}\n\n" + USAGE.format(n=tool.name, d=tool.default))
+        settings = [e.key for e in tool.elements]
+        print("\nsettings: " + " ".join(settings))
     elif a in ("-l", "--list"):
-        on = tool.active()
+        on, dirty = tool.active(), tool.draft() is not None
         for name, src in tool.listing():
-            print(f"{'•' if name == on else ' '} {name:<20} {src}")
-    elif a in ("-s", "--status"):
-        print(f"{tool.active()} · {tool.source(tool.active())}")
+            mark = "•" if name == on else " "
+            print(f"{mark} {name:<20} {src}" + ("  · unsaved changes" if name == on and dirty else ""))
+    elif a == "--status":
+        print(f"{tool.active()} · {tool.source(tool.active())}" + (" · unsaved changes" if tool.draft() else ""))
     elif a in ("-r", "--reset"):
+        if tool.draft() and "--force" not in argv:
+            die(unsaved())
         tool.set_active(tool.default)
         print(tool.default)
-    elif a == "--print":
-        name = argv[1] if len(argv) > 1 else tool.active()
-        preset = tool.load(name) or die(f"no preset '{name}' (try -l)")
-        for line in tool.render(preset, term_width()):
-            print(line if sys.stdout.isatty() else SGR.sub("", line))
-    elif a == "--save":
-        name = argv[1] if len(argv) > 1 else die("--save needs a name", 2)
+    elif a in ("-d", "--drop"):
+        if not tool.draft():
+            die("no unsaved changes")
+        tool.drop_draft()
+        tool.applied(tool.active(), tool.active_preset())
+        print(f"dropped changes · {tool.active()} as saved")
+    elif a in ("-s", "--save") and len(argv) == 1:
+        if not tool.draft():
+            die("no unsaved changes")
+        name = tool.save_draft()
+        print(f"saved {name}")
+    elif a in ("-S", "--save-as", "--save"):
+        name = argv[1] if len(argv) > 1 else die(f"{a} needs a name", 2)
         bad = name_problem(tool, name)
         if bad:
             die(bad)
-        tool.save(name, tool.active_preset())
-        print(f"saved {tool.path(name).replace(HOME, '~', 1)}")
+        tool.save_as(name)
+        print(f"saved as {name} · now in use")
+    elif a == "--print":
+        name = argv[1] if len(argv) > 1 else None
+        preset = tool.load(name) if name else tool.active_preset()
+        if preset is None:
+            die(f"no preset '{name}' (try -l)")
+        for line in tool.render(preset, term_width()):
+            print(line if sys.stdout.isatty() else SGR.sub("", line))
     elif a and a.startswith("-"):
         die(f"unknown option {a} (try -h)", 2)
-    elif a:
-        if not tool.source(a):
-            die(f"no preset '{a}' (try -l)")
+    elif a and len(argv) == 1 and tool.source(a):
+        if tool.draft() and a != tool.active():
+            die(unsaved())
         tool.set_active(a)
         print(a)
+    elif a:
+        e = tool.find(a) or die(f"no preset or setting '{a}' (try -l or -h)")
+        preset = tool.active_preset()
+        if len(argv) == 1:
+            v = (e.key in preset["show"]) if e.kind == "show" else preset["set"].get(e.key)
+            if e.kind == "show":
+                print("on" if v else "off")
+            else:
+                note = tool.value(e.key)
+                print(shown(e, v) if v is not None else "unset" + (f" · {note}" if note else ""))
+            return
+        try:
+            v = e.parse(" ".join(argv[1:]))
+        except ValueError as err:
+            die(str(err))
+        if e.kind == "show":
+            preset["show"] = [k for k in preset["show"] if k != e.key] + ([e.key] if v else [])
+        else:
+            preset["set"][e.key] = v
+        tool.set_draft(tool.clean(preset))
+        print(f"{e.key} = {'on' if v is True else 'off' if v is False else shown(e, v)}"
+              f" · {tool.active()}" + (" · unsaved, -s saves" if tool.draft() else ""))
     else:
         if not os.isatty(sys.stdout.fileno()):
-            die("the picker needs a terminal", 2)
+            die("the menu needs a terminal", 2)
         App(tool).run()
 
 
@@ -450,12 +594,13 @@ def keys(data):
 
 
 HELP = {
-    "list": (("↑↓", "move"), ("enter", "use it"), ("e →", "edit"), ("n", "new from this"),
-             ("⌫ ⌫", "delete yours"), ("q esc", "quit")),
+    "list": (("↑↓", "move"), ("enter", "use it"), ("e →", "use and edit"), ("n", "new from this"),
+             ("s", "save changes"), ("S", "save as new"), ("⌫ ⌫", "delete yours"), ("q esc", "quit")),
     "edit": (("↑↓", "move"), ("space", "show or hide"), ("←→", "change a setting"),
              ("⇧←→", "change by 10 steps"), ("enter", "pick or type"), ("x", "unset"),
-             ("⇧↑↓ K J", "reorder"), ("z  y", "undo  redo"), ("⌫ ⌫", "undo all"),
-             ("esc ←", "back"), ("", "changes save as you go")),
+             ("⇧↑↓ K J", "reorder"), ("z  y", "undo  redo"), ("s", "save changes"),
+             ("S", "save as new"), ("⌫ ⌫", "drop changes"), ("esc ←", "back"),
+             ("", "changes apply at once")),
     "choose": (("type", "filter"), ("↑↓", "move"), ("enter", "take it"), ("esc", "back")),
 }
 
@@ -464,9 +609,10 @@ HELP = {
 
 class App:
     """Three levels. The list of presets, with the hovered one drawn on the
-    right. The editor for one preset. And a list for a setting with many
-    options. Edits save as they happen, so esc only goes back. Undo all and
-    delete are armed: ⌫ once says what goes."""
+    right. The editor for the preset in use. And a list for a setting with
+    many options. Edits apply at once and stay unsaved until s or S, so esc
+    only goes back. Dropping changes and deleting are armed: ⌫ once says
+    what goes. Switching presets with changes open is armed too."""
 
     def __init__(self, tool):
         self.t = tool
@@ -532,15 +678,24 @@ class App:
 
     # --- actions ----------------------------------------------------------------
 
+    def switch(self, name, k, armed, then):
+        """Make name the preset in use, then run then(). With unsaved changes
+        to another preset, the first press of k only says what it drops."""
+        if name != self.t.active() and self.t.draft() and armed != k:
+            self.armed = k
+            self.say(f"unsaved changes to {self.t.active()} · {k} again drops them · s saves", RED)
+            return
+        if name != self.t.active():
+            self.t.set_active(name)
+        then()
+
     def use(self):
         name = self.hovered()
-        self.t.set_active(name)
         self.say(f"✓ in use · {name} · {self.t.pickup}", GREEN)
 
     def open(self, name):
-        self.name, self.preset = name, self.t.load(name)
-        self.first = json.dumps(self.preset)
-        self.was_builtin = self.t.source(name) == "built-in"
+        self.name, self.preset = name, self.t.active_preset()
+        self.first = json.dumps(self.t.load(name))
         self.undo, self.redo = [], []
         self.mode, self.ei, self.eoff = "edit", 0, 0
         self.folded = set()
@@ -558,18 +713,15 @@ class App:
         self.change(lambda p: p["set"].__setitem__(key, v))
 
     def store(self):
-        if self.was_builtin and json.dumps(self.preset) == self.first:
-            self.t.delete(self.name)          # back to the built-in exactly
-            self.say("✓ saved · same as the built-in", GREEN)
+        try:
+            self.t.set_draft(self.t.clean(self.preset))
+        except OSError as e:
+            self.say(f"could not keep the change: {e.strerror}", RED)
+            return
+        if self.t.draft():
+            self.say("unsaved · s saves into " + self.name + " · S saves as new", YELLOW)
         else:
-            try:
-                self.t.save(self.name, self.preset)
-                self.say("✓ saved", GREEN)
-            except OSError as e:
-                self.say(f"save failed: {e.strerror}", RED)
-                return
-        if self.name == self.t.active():
-            self.t.applied(self.name, self.preset)
+            self.say(f"same as {self.name} as saved", DIM)
 
     def step(self, src, dst):
         if not src:
@@ -578,6 +730,36 @@ class App:
         dst.append(json.dumps(self.preset))
         self.preset = json.loads(src.pop())
         self.store()
+
+    def save(self):
+        if not self.t.draft():
+            self.say("no unsaved changes", DIM)
+            return
+        name = self.t.save_draft()
+        self.rows = self.t.listing()
+        if self.mode == "edit":
+            self.first = json.dumps(self.t.load(name))
+        self.say(f"✓ saved into {name}", GREEN)
+
+    def save_as(self):
+        base = self.t.active()
+        n = 2
+        while self.t.source(f"{base}-{n}"):
+            n += 1
+
+        def take(name):
+            name = name.strip()
+            bad = name_problem(self.t, name)
+            if bad:
+                self.say(bad, RED)
+                return
+            self.t.save_as(name)
+            self.rows = self.t.listing()
+            self.li = [r[0] for r in self.rows].index(name)
+            if self.mode == "edit":
+                self.name, self.first = name, json.dumps(self.t.load(name))
+            self.say(f"✓ saved as {name} · now in use", GREEN)
+        self.prompt = ["save as", f"{base}-{n}", take]
 
     def new_from(self, base):
         def make(name):
@@ -589,8 +771,7 @@ class App:
             self.t.save(name, self.t.load(base))
             self.rows = self.t.listing()
             self.li = [n for n, _ in self.rows].index(name)
-            self.open(name)
-            self.say(f"✓ new preset {name}", GREEN)
+            self.say(f"✓ new preset {name} · e uses and edits it", GREEN)
         n = 2
         while self.t.source(f"{base}-{n}"):
             n += 1
@@ -707,11 +888,15 @@ class App:
         if k in ("up", "down"):
             self.li = (self.li + (1 if k == "down" else -1)) % len(self.rows)
         elif k == "enter":
-            self.use()
+            self.switch(name, k, armed, self.use)
         elif k in ("e", "right"):
-            self.open(name)
+            self.switch(name, k, armed, lambda: self.open(name))
         elif k == "n":
             self.new_from(name)
+        elif k == "s":
+            self.save()
+        elif k == "S":
+            self.save_as()
         elif k == "bs":
             if src == "built-in":
                 self.say("built in · nothing to delete", DIM)
@@ -804,17 +989,22 @@ class App:
             self.step(self.undo, self.redo)
         elif k == "y":
             self.step(self.redo, self.undo)
+        elif k == "s":
+            self.save()
+        elif k == "S":
+            self.save_as()
         elif k == "bs":
-            if json.dumps(self.preset) == self.first:
-                self.say("nothing to undo", DIM)
+            if not self.t.draft():
+                self.say("no unsaved changes", DIM)
             elif armed != "bs":
                 self.armed = "bs"
-                self.say(f"⌫ again undoes every change since you opened {self.name}", RED)
+                self.say(f"⌫ again drops every unsaved change to {self.name}", RED)
             else:
                 self.undo.append(json.dumps(self.preset))
-                self.preset = json.loads(self.first)
-                self.store()
-                self.say(f"✓ back to how {self.name} was when you opened it", GREEN)
+                self.t.drop_draft()
+                self.preset = self.t.active_preset()
+                self.t.applied(self.name, self.preset)
+                self.say(f"✓ dropped · {self.name} as saved", GREEN)
         elif k in ("esc", "q"):
             self.back()
 
@@ -867,7 +1057,8 @@ class App:
         inner = (2, 1, lw - 2, bh - 2)
         if self.mode == "list":
             self.draw_list(c, *inner)
-            preset = self.t.load(self.hovered())
+            name = self.hovered()
+            preset = self.t.active_preset() if name == self.t.active() else self.t.load(name)
         elif self.mode == "edit":
             self.draw_edit(c, *inner)
             preset = self.preset
@@ -891,16 +1082,19 @@ class App:
         x = len(self.t.name) + 3
         c.put(0, x, self.t.title, DIM, limit=w - x - 30)
         right = f"in use · {self.t.active()} "
+        if self.t.draft():
+            c.put(0, w - len(right) - 9, "unsaved", YELLOW)
         c.put(0, w - len(right), right, DIM)
 
     def draw_list(self, c, y, x, w, h):
-        on = self.t.active()
+        on, dirty = self.t.active(), self.t.draft() is not None
         self.loff = max(min(self.loff, self.li), self.li - h + 1)
         for r in range(min(h, len(self.rows) - self.loff)):
             i = self.loff + r
             name, src = self.rows[i]
             mark = "•" if name == on else " "
-            text = f"{mark} {name}".ljust(w - 10)[:w - 10]
+            star = " *" if name == on and dirty else ""
+            text = f"{mark} {name}{star}".ljust(w - 10)[:w - 10]
             c.put(y + r, x + 1, text, REV if i == self.li else "")
             c.put(y + r, x + w - 9, src.rjust(8), DIM)
 
@@ -999,7 +1193,7 @@ class App:
 
     def hints(self):
         if self.mode == "list":
-            return "↑↓ move · enter use · e edit · n new · ? keys"
+            return "↑↓ move · enter use · e edit · s save · S save as · ? keys"
         if self.mode == "choose":
             e = self.t.element(self.choose[0])
             if not self.filtered() and callable(e.choices) and self.choose[2].strip():
@@ -1007,7 +1201,7 @@ class App:
             return "type to filter · ↑↓ move · enter take · esc back"
         kind, ref = self.erows()[self.ei]
         if kind == "group":
-            return "enter fold · -/+ fold all · z undo · esc back · ? keys"
+            return "enter fold · -/+ fold all · s save · z undo · esc back · ? keys"
         e = self.t.element(ref)
         own = {"show": "space show/hide · ⇧↑↓ reorder",
                "choice": "←→ change" + (" · enter list" if callable(e.choices) or len(e.choices) > LIST_AT else ""),
@@ -1018,7 +1212,7 @@ class App:
             own += " · x unset"
         for key, (label, _) in e.actions.items():
             own += f" · {key} {label}"
-        return own + " · z undo · esc back · ? keys"
+        return own + " · s save · z undo · esc back · ? keys"
 
     def draw_footer(self, c, w, y):
         if self.prompt:
