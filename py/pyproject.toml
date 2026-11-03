@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "timetools"
+version = "0.2.0"
+description = "Time tools for the terminal and the browser: stopwatch, timer, metronome, counter, fireworks."
+requires-python = ">=3.9"
+
+[project.scripts]
+tt = "timetools.cli:main"
+
+[tool.setuptools]
+packages = ["timetools", "timetools.views"]
