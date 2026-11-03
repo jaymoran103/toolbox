@@ -1,0 +1,16 @@
+{
+  "about": "The Arcade's cart cover: the picture inset in a black frame, the name in orange top left, the version big top right, the handle and the green cube.",
+  "size": 512,
+  "background": "#000000",
+  "window": { "x": 60, "y": 60, "w": 396, "h": 396 },
+  "title": {
+    "x": 66, "y": 104, "lineHeight": 46, "split": "-",
+    "font": "700 44px \"Ubuntu\", \"Arial Black\", \"Helvetica Neue\", sans-serif",
+    "fill": "#ffa300", "stroke": "rgba(0,0,0,.65)", "strokeWidth": 6
+  },
+  "version": {
+    "x": 446, "y": 128, "align": "right", "short": true,
+    "font": "700 76px \"Ubuntu\", \"Arial Black\", \"Helvetica Neue\", sans-serif",
+    "fill": "#ffa300", "stroke": "rgba(0,0,0,.65)", "strokeWidth": 8
+  }
+}

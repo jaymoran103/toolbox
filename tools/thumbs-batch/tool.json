@@ -1,0 +1,12 @@
+{
+  "name": "thumbs-batch",
+  "about": "one branded thumbnail PNG per screenshot: your frame, the name and the version",
+  "template": "none",
+  "entries": [
+    "bin/thumbs-batch"
+  ],
+  "links": {},
+  "needs": [
+    "python3"
+  ]
+}
