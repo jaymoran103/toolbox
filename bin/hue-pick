@@ -1,0 +1,1140 @@
+#!/usr/bin/env python3
+"""hue-pick — pick a few hues, get a family of steps for each.
+
+  hue-pick [options]          pick in the terminal
+  hue-pick --assign JSON      give each group of a caller its own hue ('-' reads stdin, @file a file)
+  hue-pick check [--html F]   check every hue in hues.json, and draw a sheet
+  hue-pick --list             list the hues
+
+  -t, --title TEXT    say what the palette is for, on the top line
+      --hues LIST     the hues to start on, by name: red,teal,plum
+  -s, --steps N       colours in each family: 1 to 5 in xterm-256, 1 to 7 in full colour
+  -x, --xterm         xterm-256 mode, as a TUI draws: hand-checked steps (the default for awday)
+      --full          full-colour mode: steps made from each hue's lightness range
+      --strength N    full colour only: how vivid, 60 to 100
+  -f, --format FMT    json (the default), hex (a family a line) or css
+  -o, --out FILE      also write the palette as JSON on every change
+      --print         print the palette for the options given, no picker
+      --tab           pick in a new Ghostty tab, and this process waits
+      --split         the same, in a split to the right
+      --nested        the caller already holds the alternate screen
+
+Enter prints the palette and exits 0. Esc or q prints nothing and exits 1.
+A usage error exits 2. It opens on your last pick, with any options on top.
+
+Every hue is a family, and families never share a colour. The picker lists
+them all, each drawn as its family. ↑ ↓ move, space on a hue adds or
+removes it, and the order you add them is the palette's order.
+2 or 3 hues usually read best. + and - set how many steps each family
+gives. m switches mode. s shuffles to hues that sit apart, b steps back.
+
+Two modes, because a terminal's 256 colours are not full colour:
+  xterm-256   each hue's five steps are chosen by hand from the colours a
+              256-colour terminal can draw, darkest first. Fewer steps take
+              an even spread of the five.
+  full colour each hue steps through its own lightness range at one
+              strength (OKLCH), so steps line up in lightness across hues.
+
+--assign is for a caller with named groups, like awforge. Each group picks
+one hue, and several may share one. A group's own colour is one of its hue's
+five steps: the middle for the first group on a hue, the next for the next,
+or one set by hand with [ ]. Its items keep a step set by hand; the rest take
+the steps outward from it, lighter first, by rank. Each row shows its items as
+a sorted view lists them, dark to light. A hue next to its wheel neighbour on
+the next group gets a warning, never a block. The rules live in
+lib/hue_rules.py, which callers load too, so what you see is what they draw. JSON in:
+  {"groups": [{"key": "engineering", "label": "eng", "hue": "red", "step": null, "n": 8,
+               "items": [null, 4, null, ...]}], "steps": 3}         items: a step per item by rank, null for auto
+JSON out: {"assign": {key: hue}, "step": {key: step}, "fixed": {key: step set by hand},
+  "steps": n, "families": [each hue used, five steps], "item_steps": {key: [step by rank]},
+  "colours": {key: [group colour, items by rank...]}, "neighbours": [[key, key, hue, hue]]}.
+It is xterm-256 only, as a curses TUI draws.
+
+The hues live in hues.json: ~/.config/hue-pick/hues.json if it exists,
+else the toolbox's own, config/hue-pick/hues.json. To add a hue, add an entry with
+a name, an OKLCH hue angle, a lightness range and five xterm colours, then
+run `hue-pick check`: it fails on a bad entry and names the hues that come
+close to each other.
+"""
+
+import base64
+import itertools
+import json
+import math
+import os
+import random
+import re
+import select
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+import tty
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
+import hue_rules as R            # the step rules, shared with the callers that draw what --assign picks
+
+HOME = os.path.expanduser("~")
+STATE = os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local", "state"))
+CONFIG = os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config"))
+LAST = os.path.join(STATE, "hue-pick", "last.json")
+HUES_FILES = R.HUES_FILES
+
+BOLD, DIM, REV, RED = "\x1b[1m", "\x1b[2m", "\x1b[7m", "\x1b[31m"
+MAX_W, MIN_W = 76, 56
+MAX_HUES, XTERM_STEPS, FULL_STEPS = 6, R.STEPS, 7
+STRENGTH = (60, 100)
+CLOSE, APART = 6.0, 6.0         # ΔE: steps in a family, and colours across families, at least this far apart
+
+
+# --- the model --------------------------------------------------------------
+
+def load_hues():
+    for path in HUES_FILES:
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    return json.load(f)["hues"], path
+            except (OSError, ValueError, KeyError) as e:
+                die(f"hue-pick: cannot read {path}: {e}")
+    die("hue-pick: no hues.json · looked in " + " and ".join(HUES_FILES))
+
+
+def spread(n, of):
+    """n indices spread evenly over range(of), ends included."""
+    return [of // 2] if n == 1 else [round(j * (of - 1) / (n - 1)) for j in range(n)]
+
+
+def family(h, mode, steps, strength):
+    """One hue's colours, darkest first."""
+    if mode == "xterm":
+        return [h["xterm"][i] for i in spread(min(steps, len(h["xterm"])), len(h["xterm"]))]
+    lo, hi = h["light"]
+    Ls = [(lo + hi) / 2] if steps == 1 else [lo + (hi - lo) * j / (steps - 1) for j in range(steps)]
+    return [rel(L, strength, h["hue"]) for L in Ls]
+
+
+def judge(fams):
+    """The closest call: ("ok" | "steps" | "hues", ΔE, hex, hex, i, j)."""
+    sib = min(((delta(a, b), a, b, i, i) for i, f in enumerate(fams) for a, b in zip(f, f[1:])),
+              default=None)
+    far = min(((delta(a, b), a, b, i, i + 1 + k) for i, f in enumerate(fams)
+               for k, g in enumerate(fams[i + 1:]) for a in f for b in g), default=None)
+    if sib and sib[0] < 3:
+        return ("steps",) + sib
+    if far and far[0] < APART:
+        return ("hues",) + far
+    return ("ok",) + (far or sib or (99, None, None, 0, 0))
+
+
+# --- colour -----------------------------------------------------------------
+
+def rgb(h):
+    return tuple(int(h[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def hexof(r, g, b):
+    return "#%02x%02x%02x" % (r, g, b)
+
+
+def norm(v):
+    """#rrggbb from #rgb, rrggbb, 0xrrggbb and the like, or None."""
+    v = v.strip().strip("\"'").lower()
+    v = v[2:] if v.startswith("0x") else v.lstrip("#")
+    if re.fullmatch(r"[0-9a-f]{3}", v):
+        v = "".join(ch * 2 for ch in v)
+    return "#" + v if re.fullmatch(r"[0-9a-f]{6}", v) else None
+
+
+def lin(c):
+    c /= 255
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def unlin(c):
+    c = max(0.0, min(1.0, c))
+    return round(255 * (12.92 * c if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055))
+
+
+def lab(h):
+    r, g, b = (lin(v) for v in rgb(h))
+    l, m, s = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b,
+               0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b,
+               0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b)
+    l, m, s = (math.copysign(abs(x) ** (1 / 3), x) for x in (l, m, s))
+    return (0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+            1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+            0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s)
+
+
+def hue_of(h):
+    _, a, b = lab(h)
+    return round(math.degrees(math.atan2(b, a))) % 360
+
+
+def linear_rgb(L, C, h):
+    a, b = C * math.cos(math.radians(h)), C * math.sin(math.radians(h))
+    l, m, s = ((L + 0.3963377774 * a + 0.2158037573 * b) ** 3,
+               (L - 0.1055613458 * a - 0.0638541728 * b) ** 3,
+               (L - 0.0894841775 * a - 1.2914855480 * b) ** 3)
+    return (4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+            -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+            -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s)
+
+
+def max_chroma(L, h):
+    lo, hi = 0.0, 0.4
+    for _ in range(18):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if all(-1e-4 <= v <= 1 + 1e-4 for v in linear_rgb(L, mid, h)) else (lo, mid)
+    return lo
+
+
+def rel(L, strength, h):
+    """The colour at lightness L (0-100) with strength% of the chroma h can carry there."""
+    L = max(0, min(100, L)) / 100
+    return hexof(*(unlin(v) for v in linear_rgb(L, max_chroma(L, h) * strength / 100, h)))
+
+
+def delta(a, b):
+    return 100 * math.dist(lab(a), lab(b))
+
+
+def FG(h):
+    return "\x1b[38;2;%d;%d;%dm" % rgb(h)
+
+
+def BG(h):
+    return "\x1b[48;2;%d;%d;%dm" % rgb(h)
+
+
+def ink(h):
+    r, g, b = rgb(h)
+    return "#000000" if 0.299 * r + 0.587 * g + 0.114 * b > 140 else "#ffffff"
+
+
+def load_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_atomic(path, text):
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".hue-pick.")
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+class Palette:
+    def __init__(self, hues, chosen, mode, steps, strength):
+        self.all = hues                                  # every hue in hues.json
+        self.chosen = list(chosen)                       # names, in palette order
+        self.mode, self.steps, self.strength = mode, steps, strength
+
+    def by_name(self, name):
+        return next(h for h in self.all if h["name"] == name)
+
+    def max_steps(self):
+        return XTERM_STEPS if self.mode == "xterm" else FULL_STEPS
+
+    def fam(self, name):
+        return family(self.by_name(name), self.mode, min(self.steps, self.max_steps()), self.strength)
+
+    def families(self):
+        return [self.fam(n) for n in self.chosen]
+
+    def state(self):
+        return dict(chosen=list(self.chosen), mode=self.mode, steps=self.steps, strength=self.strength)
+
+    def restore(self, s):
+        self.chosen, self.mode, self.steps, self.strength = list(s["chosen"]), s["mode"], s["steps"], s["strength"]
+
+    def toggle(self, name):
+        if name in self.chosen:
+            self.chosen.remove(name)
+        elif len(self.chosen) < MAX_HUES:
+            self.chosen.append(name)
+        else:
+            return False
+        return True
+
+    def shuffle(self, rng):
+        """2 or 3 hues that sit well apart: the best of 80 tries, by closest pair."""
+        k = max(2, min(3, len(self.chosen) or 3))
+        best = None
+        for _ in range(80):
+            pick = rng.sample([h["name"] for h in self.all], k)
+            fams = [self.fam(n) for n in pick]
+            v = judge(fams)
+            score = (v[0] == "ok", v[1])
+            if not best or score > best[0]:
+                best = (score, pick)
+        self.chosen = best[1]
+
+    def output(self):
+        fams = self.families()
+        return {"families": fams, "palette": [c for f in fams for c in f], "hues": list(self.chosen),
+                "mode": self.mode, "steps": min(self.steps, self.max_steps()),
+                "strength": self.strength, "xterm": self.mode == "xterm", "verdict": judge(fams)[0]}
+
+    def formatted(self, how):
+        o = self.output()
+        if how == "hex":
+            return "\n".join(" ".join(f) for f in o["families"])
+        if how == "css":
+            return ":root {\n" + "\n".join("  --%s-%d: %s;" % (n, j + 1, h) for n, f in zip(o["hues"], o["families"])
+                                           for j, h in enumerate(f)) + "\n}"
+        return json.dumps(o, indent=2)
+
+
+class Canvas:
+    """A grid of (char, style) cells, flushed in one write so nothing tears."""
+
+    def __init__(self, w, h):
+        self.w, self.h = w, h
+        self.cells = [[(" ", "")] * w for _ in range(h)]
+
+    def put(self, y, x, text, style="", limit=None):
+        if not 0 <= y < self.h:
+            return
+        if limit is not None:
+            text = text[:max(0, limit)]
+        row = self.cells[y]
+        for i, ch in enumerate(text):
+            if 0 <= x + i < self.w:
+                row[x + i] = (ch, style)
+
+    def centred(self, w, h):
+        big = Canvas(w, h)
+        oy, ox = (h - self.h) // 2, (w - self.w) // 2
+        for y, row in enumerate(self.cells):
+            big.cells[oy + y][ox:ox + self.w] = row
+        return big
+
+    def render(self):
+        out = ["\x1b[H"]
+        for y, row in enumerate(self.cells):
+            style = None
+            for ch, st in row:
+                if st != style:
+                    out.append("\x1b[0m" + st)
+                    style = st
+                out.append(ch)
+            out.append("\x1b[0m")
+            if y < self.h - 1:
+                out.append("\r\n")
+        return "".join(out)
+
+
+def box(c, y, x, w, h):
+    c.put(y, x, "╭" + "─" * (w - 2) + "╮", DIM)
+    for r in range(y + 1, y + h - 1):
+        c.put(r, x, "│", DIM)
+        c.put(r, x + w - 1, "│", DIM)
+    c.put(y + h - 1, x, "╰" + "─" * (w - 2) + "╯", DIM)
+
+
+def cells(c, y, x, w, colours, mark=None, text=False):
+    """colours side by side across w columns, the spare columns spread out."""
+    n = len(colours)
+    for j, v in enumerate(colours):
+        a, b = x + j * w // n, x + (j + 1) * w // n
+        label = v if text and b - a >= 9 else ("◆" if j == mark else "")
+        c.put(y, a, label.center(b - a), BG(v) + FG(ink(v)))
+
+
+# --- keys -------------------------------------------------------------------
+
+SEQ = {"[A": "up", "[B": "down", "[C": "right", "[D": "left",
+       "OA": "up", "OB": "down", "OC": "right", "OD": "left",
+       "[1;2C": "S-right", "[1;2D": "S-left", "[1;2A": "up", "[1;2B": "down",
+       "[Z": "S-tab", "[5~": "pgup", "[6~": "pgdn"}
+PLAIN = {"\r": "enter", "\n": "enter", "\t": "tab", "\x7f": "bs", "\x08": "bs",
+         "\x03": "ctrl-c"}
+CSI = re.compile(r"\x1b(\[[0-9;]*[A-Za-z~]|O[A-Za-z])")
+PASTE_ON, PASTE_OFF = "\x1b[200~", "\x1b[201~"
+
+
+def keys(data):
+    s, i = data.decode("utf-8", "ignore"), 0
+    while i < len(s):
+        if s.startswith(PASTE_ON, i):
+            end = s.find(PASTE_OFF, i)
+            end = len(s) if end < 0 else end
+            yield "paste:" + s[i + len(PASTE_ON):end]
+            i = end + len(PASTE_OFF)
+            continue
+        m = CSI.match(s, i)
+        if m:
+            yield SEQ.get(m.group(1), "")
+            i = m.end()
+            continue
+        yield "esc" if s[i] == "\x1b" else PLAIN.get(s[i], s[i])
+        i += 1
+
+
+def copy_text(text):
+    """Into the clipboard: a native tool when there is one, else OSC 52."""
+    for cmd in (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"]):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, input=text.encode(), check=True, timeout=2)
+                return ""
+            except (OSError, subprocess.SubprocessError):
+                pass
+    return "\x1b]52;c;%s\a" % base64.b64encode(text.encode()).decode()
+
+
+# --- app --------------------------------------------------------------------
+
+class App:
+    def __init__(self, pal, title, fmt, out_file, nested):
+        self.tty = os.open("/dev/tty", os.O_RDWR)
+        self.p, self.start = pal, pal.state()
+        self.title, self.fmt, self.out_file, self.nested = title, fmt, out_file, nested
+        self.rng = random.Random()
+        self.row = 0
+        self.back, self.msg, self.result, self.done = [], None, None, False
+
+    def out(self, s):
+        os.write(self.tty, s.encode())
+
+    def say(self, text, style=""):
+        self.msg = (text, style)
+
+    def changed(self):
+        if self.out_file:
+            try:
+                write_atomic(self.out_file, self.p.formatted("json") + "\n")
+            except OSError as e:
+                self.say(f"cannot write {self.out_file}: {e.strerror}", RED)
+
+    def keep(self):
+        self.back = (self.back + [self.p.state()])[-50:]
+
+    def rows(self):
+        return [("hue", h["name"]) for h in self.p.all] + [("steps",)] + ([("strength",)] if self.p.mode == "full" else [])
+
+    def here(self):
+        rows = self.rows()
+        self.row = max(0, min(self.row, len(rows) - 1))
+        return rows[self.row]
+
+    def key(self, k):
+        if k == "ctrl-c":
+            self.done = True
+            return
+        self.msg = None
+        k = {"j": "down", "k": "up", "h": "left", "l": "right"}.get(k, k)
+        p, here = self.p, self.here()
+        if k == " " and here[0] == "hue":
+            self.keep()
+            if p.toggle(here[1]):
+                self.changed()
+            else:
+                self.say(f"{MAX_HUES} hues at most")
+        elif k == "enter":
+            self.result, self.done = p.formatted(self.fmt), True
+        elif k in ("esc", "q"):
+            self.done = True
+        elif k in ("up", "down", "tab", "S-tab"):
+            self.row = (self.row + (1 if k in ("down", "tab") else -1)) % len(self.rows())
+        elif k in ("+", "=", "-", "_") or (k in ("left", "right", "S-left", "S-right") and here[0] == "steps"):
+            up = k in ("+", "=", "right", "S-right")
+            p.steps = max(1, min(p.max_steps(), min(p.steps, p.max_steps()) + (1 if up else -1)))
+            self.changed()
+        elif k in ("left", "right", "S-left", "S-right") and here[0] == "strength":
+            p.strength = max(STRENGTH[0], min(STRENGTH[1], p.strength + (5 if k.endswith("right") else -5)))
+            self.changed()
+        elif k == "m":
+            p.mode = "full" if p.mode == "xterm" else "xterm"
+            self.say("full colour" if p.mode == "full" else "xterm-256: hand-checked steps")
+            self.changed()
+        elif k == "s":
+            self.keep()
+            p.shuffle(self.rng)
+            self.say("shuffled to " + ", ".join(p.chosen))
+            self.changed()
+        elif k == "b":
+            if self.back:
+                p.restore(self.back.pop())
+                self.changed()
+            else:
+                self.say("nothing to go back to")
+        elif k == "c":
+            self.out(copy_text(p.formatted(self.fmt)))
+            self.say(f"copied the {self.fmt}")
+
+    # --- layout -------------------------------------------------------------
+
+    def height(self):
+        return 2 + 3 + 2 + len(self.p.all) + 2 + 2 + (2 if self.p.mode == "full" else 0) + 2 + 1
+
+    def draw(self):
+        tw, th = os.get_terminal_size(self.tty)
+        w, bh = min(tw, MAX_W), self.height()
+        if w < MIN_W or th < bh + 4:
+            c = Canvas(tw, th)
+            c.put(th // 2, 1, f"need {MIN_W}×{bh + 4} · now {tw}×{th}", DIM)
+            return self.out(c.render())
+        p, fams = self.p, self.p.families()
+        x, iw = 2, w - 4
+        tx, tr = x + 11, iw - 11
+        here = self.here()
+        c = Canvas(w, bh + 4)
+
+        n = len(p.chosen)
+        right = ("xterm-256" if p.mode == "xterm" else "full colour") + f" · {min(p.steps, p.max_steps())} steps"
+        c.put(0, 1, "hue-pick", BOLD)
+        if self.title:
+            room = w - len(right) - 14
+            c.put(0, 9, " · " + (self.title if len(self.title) <= room else self.title[:max(0, room - 1)] + "…"))
+        c.put(0, w - 1 - len(right), right, BOLD)
+        box(c, 1, 0, w, bh)
+
+        # The palette, in the order the hues were added, then the closest call.
+        c.put(2, x, "palette", DIM)
+        if not fams:
+            c.put(2, tx, "space on a hue below adds it · 2 or 3 usually read best", DIM)
+        else:
+            span = tr - (n - 1)
+            for i, f in enumerate(fams):
+                a, b = tx + i * span // n + i, tx + (i + 1) * span // n + i
+                cells(c, 2, a, b - a, f, text=True)
+                cells(c, 3, a, b - a, f)
+            kind, d, ca, cb, i, j = judge(fams)
+            if kind == "hues":
+                text, style = f"{p.chosen[i]} and {p.chosen[j]} come close", RED
+            elif kind == "steps":
+                text, style = f"{p.chosen[i]}'s steps look alike", RED
+            else:
+                text, style = "every colour tells apart", DIM
+            c.put(4, tx, text, style)
+            if kind != "ok":
+                for k, v in enumerate((ca, cb)):
+                    c.put(4, tx + len(text) + 1 + 3 * k, "  ", BG(v))
+                c.put(4, tx + len(text) + 8, "pick hues further apart" if kind == "hues" else "use fewer steps", style)
+
+        # Every hue, drawn as its family. The chosen ones carry their place.
+        y = 6
+        c.put(y, x, "hues", BOLD)
+        c.put(y, tx, "space adds or removes · palette goes in the order added", DIM, limit=tr)
+        for h in p.all:
+            y += 1
+            on = here == ("hue", h["name"])
+            at = p.chosen.index(h["name"]) + 1 if h["name"] in p.chosen else 0
+            c.put(y, x, ("› " if on else "  ") + (str(at) if at else " ") + " " + h["name"],
+                  BOLD if (on or at) else DIM)
+            cells(c, y, tx, tr, p.fam(h["name"]), text=bool(at))
+
+        # Steps, and strength in full colour.
+        y += 2
+        on = here == ("steps",)
+        m = p.max_steps()
+        c.put(y, x, ("› " if on else "  ") + "steps", BOLD if on else DIM)
+        for k in range(1, m + 1):
+            c.put(y, tx + (k - 1) * 4, f" {k} ", (BOLD + REV) if k == min(p.steps, m) else DIM)
+        c.put(y, tx + m * 4 + 1, "of the five hand-checked" if p.mode == "xterm" else "across each hue's lightness", DIM)
+        if p.mode == "full":
+            y += 2
+            on = here == ("strength",)
+            c.put(y, x, ("› " if on else "  ") + "strength", BOLD if on else DIM)
+            pos = round((p.strength - STRENGTH[0]) * (tr - 9) / (STRENGTH[1] - STRENGTH[0]))
+            for k in range(tr - 8):
+                c.put(y, tx + k, "●" if k == pos else "─", (BOLD + (REV if on else "")) if k == pos else
+                      BOLD + FG("#ffffff") if k < pos else DIM)
+            c.put(y, tx + tr - 6, f"{p.strength}%", BOLD if on else DIM)
+
+        y += 2
+        tips = {"hue": "space adds or removes this hue · enter takes the palette",
+                "steps": "← → or + - · fewer steps take an even spread", "strength": "← → by 5% · 60% is the floor"}
+        c.put(y, x, tips[here[0]], DIM, limit=iw)
+        self.draw_footer(c, w, bh + 1)
+        self.out(c.centred(tw, th).render())
+
+    def draw_footer(self, c, w, y):
+        if self.msg:
+            c.put(y, 1, self.msg[0], self.msg[1], limit=w - 2)
+            y += 1
+        hints = ["enter done", "esc cancel", "↑↓ move", "space add/remove", "+- steps", "m mode", "s shuffle",
+                 "b back", "c copy"]
+        line = ""
+        for hint in hints:
+            if len(line) + len(hint) + 3 > w - 2:
+                c.put(y, 1, line, DIM)
+                y, line = y + 1, ""
+            line += (" · " if line else "") + hint
+        c.put(y, 1, line, DIM)
+
+    def run(self):
+        old = termios.tcgetattr(self.tty)
+        self.out(("\x1b[2J" if self.nested else "\x1b[?1049h") + "\x1b[?25l\x1b[?7l\x1b[?2004h")
+        tty.setraw(self.tty)
+        self.changed()
+        try:
+            size, stale = None, True
+            while not self.done:
+                now = os.get_terminal_size(self.tty)
+                if stale or now != size:
+                    self.draw()
+                    size, stale = now, False
+                if select.select([self.tty], [], [], 0.25)[0]:
+                    for k in keys(os.read(self.tty, 4096)):
+                        self.key(k)
+                        if self.done:
+                            break
+                    stale = True
+        finally:
+            termios.tcsetattr(self.tty, termios.TCSADRAIN, old)
+            self.out("\x1b[?2004l\x1b[?7h\x1b[?25h" + ("\x1b[0m\x1b[2J\x1b[H" if self.nested else "\x1b[?1049l"))
+            os.close(self.tty)
+        if self.result:
+            try:
+                write_atomic(LAST, json.dumps(self.p.state()) + "\n")
+            except OSError:
+                pass
+        elif self.out_file:
+            self.p.restore(self.start)        # a cancel puts the live preview back
+            self.changed()
+        return self.result
+
+
+# --- assign: a hue for each of a caller's groups -------------------------------
+
+class Assignment:
+    """--assign's model: a caller's groups, the hue and step each takes, and the
+    colours its items take. No terminal here, so --print and callers can use it."""
+
+    def __init__(self, hues, spec):
+        self.all = hues
+        names = [h["name"] for h in hues]
+        self.groups = []
+        for g in spec["groups"]:
+            items = [v if v in range(XTERM_STEPS) else None for v in g.get("items") or []]
+            self.groups.append(dict(g, hue=g.get("hue") if g.get("hue") in names else names[0],
+                                    step=g.get("step") if g.get("step") in range(XTERM_STEPS) else None,
+                                    items=items + [None] * max(0, int(g.get("n", 0) or 0) - len(items))))
+        self.steps = max(1, min(XTERM_STEPS, int(spec.get("steps") or 3)))
+
+    def by_name(self, name):
+        return next(h for h in self.all if h["name"] == name)
+
+    def state(self):
+        return dict(hues=[g["hue"] for g in self.groups], fixed=[g.get("step") for g in self.groups], steps=self.steps)
+
+    def restore(self, s):
+        for g, h, f in zip(self.groups, s["hues"], s.get("fixed") or [None] * len(self.groups)):
+            g["hue"], g["step"] = h, f
+        self.steps = s["steps"]
+
+    def steps_now(self):
+        return R.group_steps([(g["key"], g["hue"]) for g in self.groups], {g["key"]: g.get("step") for g in self.groups})
+
+    def colours(self, g, at):
+        """The group's colour, then its items' by rank."""
+        return R.item_colours(self.by_name(g["hue"])["xterm"], at[g["key"]], self.steps, g["items"])
+
+    def sorted_items(self, g, at):
+        """Its items' colours as a sorted view lists them: dark to light."""
+        st = R.item_steps(at[g["key"]], self.steps, g["items"])
+        xs = self.by_name(g["hue"])["xterm"]
+        return [xs[v] for v in R.by_step(st, st)]
+
+    def warnings(self):
+        return R.neighbours([(g["key"], g["hue"]) for g in self.groups], self.all)
+
+    def turn(self, i, d):
+        names = [h["name"] for h in self.all]
+        g = self.groups[i]
+        g["hue"] = names[(names.index(g["hue"]) + d) % len(names)]
+
+    def nudge_step(self, i, d):
+        g = self.groups[i]
+        g["step"] = max(0, min(XTERM_STEPS - 1, self.steps_now()[g["key"]] + d))
+        return g["step"]
+
+    def spread_hues(self):
+        """Hues spaced evenly round the wheel, in group order, from the first group's hue."""
+        names = [h["name"] for h in self.all]
+        if not self.groups:
+            return
+        at, n = names.index(self.groups[0]["hue"]), len(self.groups)
+        for i, g in enumerate(self.groups):
+            g["hue"] = names[(at + round(i * len(names) / n)) % len(names)]
+
+    def output(self):
+        at = self.steps_now()
+        return {"assign": {g["key"]: g["hue"] for g in self.groups}, "steps": self.steps, "mode": "xterm",
+                "step": at, "fixed": {g["key"]: g["step"] for g in self.groups if g.get("step") is not None},
+                "hues": [g["hue"] for g in self.groups],
+                "families": [self.by_name(h)["xterm"] for h in dict.fromkeys(g["hue"] for g in self.groups)],
+                "item_steps": {g["key"]: R.item_steps(at[g["key"]], self.steps, g["items"]) for g in self.groups},
+                "colours": {g["key"]: self.colours(g, at) for g in self.groups},
+                "neighbours": [list(w) for w in self.warnings()]}
+
+    def text(self):
+        return json.dumps(self.output(), indent=2)
+
+
+class AssignApp(App):
+    """--assign's screen: one row per group, scrolling when the groups outgrow it."""
+
+    def __init__(self, model, title, out_file, nested):
+        self.tty = os.open("/dev/tty", os.O_RDWR)
+        self.m = model
+        self.start = model.state()
+        self.title, self.out_file, self.nested = title, out_file, nested
+        self.row, self.top, self.back, self.msg, self.result, self.done = 0, 0, [], None, None, False
+
+    def keep(self):
+        self.back = (self.back + [self.m.state()])[-50:]
+
+    def changed(self):
+        if self.out_file:
+            try:
+                write_atomic(self.out_file, self.m.text() + "\n")
+            except OSError as e:
+                self.say(f"cannot write {self.out_file}: {e.strerror}", RED)
+
+    def rows(self):
+        return [("group", i) for i in range(len(self.m.groups))] + [("steps",)]
+
+    def key(self, k):
+        if k == "ctrl-c":
+            self.done = True
+            return
+        self.msg = None
+        k = {"j": "down", "k": "up", "h": "left", "l": "right"}.get(k, k)
+        m, here = self.m, self.here()
+        if k == "enter":
+            self.result, self.done = m.text(), True
+        elif k in ("esc", "q"):
+            self.done = True
+        elif k in ("up", "down", "tab", "S-tab"):
+            self.row = (self.row + (1 if k in ("down", "tab") else -1)) % len(self.rows())
+        elif k in ("pgdn", "pgup"):
+            self.row = max(0, min(len(self.rows()) - 1, self.row + (10 if k == "pgdn" else -10)))
+        elif k in ("left", "right", "S-left", "S-right") and here[0] == "group":
+            self.keep()
+            m.turn(here[1], 1 if k.endswith("right") else -1)
+            self.changed()
+        elif k in ("[", "]") and here[0] == "group":
+            self.keep()
+            g = m.groups[here[1]]
+            step = m.nudge_step(here[1], 1 if k == "]" else -1)
+            self.say("%s: step %d of 5, set by hand · 0 puts it back to auto" % (g.get("label") or g["key"], step + 1))
+            self.changed()
+        elif k == "0" and here[0] == "group":
+            self.keep()
+            m.groups[here[1]]["step"] = None
+            self.changed()
+        elif k in ("+", "=", "-", "_") or (k in ("left", "right", "S-left", "S-right") and here[0] == "steps"):
+            self.keep()
+            m.steps = max(1, min(XTERM_STEPS, m.steps + (1 if k in ("+", "=", "right", "S-right") else -1)))
+            self.changed()
+        elif len(k) == 1 and k in "12345":
+            self.keep()
+            m.steps = int(k)
+            self.changed()
+        elif k == "s":
+            self.keep()
+            m.spread_hues()
+            self.say("hues spread round the wheel, in group order")
+            self.changed()
+        elif k == "b":
+            if self.back:
+                m.restore(self.back.pop())
+                self.changed()
+            else:
+                self.say("nothing to go back to")
+        elif k == "c":
+            self.out(copy_text(m.text()))
+            self.say("copied the json")
+
+    FIXED = 11                              # every row but the groups: headings, steps, hues, tips, borders
+
+    def draw(self):
+        tw, th = os.get_terminal_size(self.tty)
+        w = min(tw, MAX_W)
+        m = self.m
+        room = max(3, th - 4 - self.FIXED)               # group rows that fit
+        shown = min(len(m.groups), room)
+        bh = self.FIXED + shown
+        if w < MIN_W or th < self.FIXED + 4 + 3:
+            c = Canvas(tw, th)
+            c.put(th // 2, 1, f"need {MIN_W}×{self.FIXED + 7} · now {tw}×{th}", DIM)
+            return self.out(c.render())
+        x, iw = 2, w - 4
+        here = self.here()
+        if here[0] == "group":                           # keep the cursor in view
+            self.top = max(min(self.top, here[1]), here[1] - shown + 1)
+        self.top = max(0, min(self.top, len(m.groups) - shown))
+        c = Canvas(w, bh + 4)
+        right = f"xterm-256 · {m.steps} step" + "s" * (m.steps > 1)
+        c.put(0, 1, "hue-pick", BOLD)
+        if self.title:
+            space = w - len(right) - 14
+            c.put(0, 9, " · " + (self.title if len(self.title) <= space else self.title[:max(0, space - 1)] + "…"))
+        c.put(0, w - 1 - len(right), right, BOLD)
+        box(c, 1, 0, w, bh)
+
+        # The groups, each drawn as its caller draws it: its own colour, then its items dark to light.
+        lw = min(18, max([len(g.get("label") or g["key"]) for g in m.groups] + [6]))
+        hx, sx = x + 2 + lw + 1, x + 2 + lw + 1 + 10
+        c.put(2, x, "groups", BOLD)
+        if len(m.groups) > shown:
+            c.put(2, x + 7, f"{self.top + 1}-{self.top + shown} of {len(m.groups)}", DIM)
+        c.put(2, sx, "← → its hue · groups may share one", DIM, limit=w - 2 - sx)
+        y = 2
+        at = m.steps_now()
+        for i in range(self.top, self.top + shown):
+            g = m.groups[i]
+            y += 1
+            on = here == ("group", i)
+            col = [m.colours(g, at)[0]] + m.sorted_items(g, at)
+            c.put(y, x, ("› " if on else "  ") + (g.get("label") or g["key"])[:lw], BOLD if on else "")
+            c.put(y, hx, "%-7s%s%d" % (g["hue"][:7], "·" if g.get("step") is None else "=", at[g["key"]] + 1),
+                  BOLD if on else DIM)
+            c.put(y, sx, "   ", BG(col[0]))
+            fit = (w - 3 - (sx + 4)) // 2
+            items = col[1:]
+            for j, v in enumerate(items[:fit]):
+                c.put(y, sx + 4 + 2 * j, "▌", FG(v))
+            if len(items) > fit:
+                c.put(y, w - 4, "+%d" % (len(items) - fit), DIM)
+        if self.top > 0:
+            c.put(3, w - 3, "↑", BOLD)
+        if self.top + shown < len(m.groups):
+            c.put(y, w - 3, "↓", BOLD)
+
+        y += 2
+        on = here == ("steps",)
+        c.put(y, x, ("› " if on else "  ") + "steps", BOLD if on else DIM)
+        for k in range(1, XTERM_STEPS + 1):
+            c.put(y, hx + (k - 1) * 4, f" {k} ", (BOLD + REV) if k == m.steps else DIM)
+        c.put(y, hx + XTERM_STEPS * 4 + 1, "shades a group's items take", DIM, limit=w - 2 - (hx + XTERM_STEPS * 4 + 1))
+
+        # The hues on offer, in two rows so every name fits, each drawn as the steps in use.
+        y += 2
+        c.put(y, x, "hues", DIM)
+        per = (len(m.all) + 1) // 2
+        cw = max(7, (w - 2 - hx) // per)
+        for j, h in enumerate(m.all):
+            r, k0 = divmod(j, per)
+            use = R.item_colours(h["xterm"], R.ITEM_ORDER[0], m.steps, [None] * m.steps)[1:]
+            each = max(1, (cw - 1) // len(use))
+            for k, v in enumerate(use):
+                c.put(y + r, hx + k0 * cw + k * each, " " * each, BG(v))
+            used = any(g["hue"] == h["name"] for g in m.groups)
+            label = h["name"][:cw - 1]
+            c.put(y + r, hx + k0 * cw, label, (BOLD if used else "") + FG(ink(use[0])) + BG(use[0]))
+
+        # Neighbouring hues on neighbouring groups: every pair, as a warning, never a block.
+        y += 3
+        warn = m.warnings()
+        lab = {g["key"]: g.get("label") or g["key"] for g in m.groups}
+        if warn:
+            text = "reads alike: " + " · ".join(f"{lab[a]} {ha} / {lab[b]} {hb}" for a, b, ha, hb in warn)
+            c.put(y - 1, x, text, RED, limit=iw)
+        shared = [h["name"] for h in m.all if sum(g["hue"] == h["name"] for g in m.groups) > 1]
+        tip = ("shared hues: " + ", ".join(shared)) if shared and here[0] == "group" else \
+            "← → its hue · [ ] the group's own step, 0 back to auto · s spreads hues" if here[0] == "group" else \
+            "← → or 1-5 · how many shades a group's items take"
+        c.put(y, x, tip, DIM, limit=iw)
+        self.draw_footer(c, w, bh + 1)
+        self.out(c.centred(tw, th).render())
+
+    def draw_footer(self, c, w, y):
+        if self.msg:
+            c.put(y, 1, self.msg[0], self.msg[1], limit=w - 2)
+            y += 1
+        line = ""
+        for hint in ("enter done", "esc cancel", "↑↓ group", "← → hue", "[ ] group step", "1-5 item shades",
+                     "s spread", "b back", "c copy"):
+            if len(line) + len(hint) + 3 > w - 2:
+                c.put(y, 1, line, DIM)
+                y, line = y + 1, ""
+            line += (" · " if line else "") + hint
+        c.put(y, 1, line, DIM)
+
+    def run(self):
+        old = termios.tcgetattr(self.tty)
+        self.out(("\x1b[2J" if self.nested else "\x1b[?1049h") + "\x1b[?25l\x1b[?7l\x1b[?2004h")
+        tty.setraw(self.tty)
+        self.changed()
+        try:
+            size, stale = None, True
+            while not self.done:
+                now = os.get_terminal_size(self.tty)
+                if stale or now != size:
+                    self.draw()
+                    size, stale = now, False
+                if select.select([self.tty], [], [], 0.25)[0]:
+                    for k in keys(os.read(self.tty, 4096)):
+                        self.key(k)
+                        if self.done:
+                            break
+                    stale = True
+        finally:
+            termios.tcsetattr(self.tty, termios.TCSADRAIN, old)
+            self.out("\x1b[?2004l\x1b[?7h\x1b[?25h" + ("\x1b[0m\x1b[2J\x1b[H" if self.nested else "\x1b[?1049l"))
+            os.close(self.tty)
+        if not self.result and self.out_file:
+            self.m.restore(self.start)          # a cancel puts the live preview back
+            self.changed()
+        return self.result
+
+
+APPLESCRIPT = """
+on run argv
+  tell application "Ghostty"
+    set cfg to new surface configuration
+    set command of cfg to item 2 of argv
+    set wait after command of cfg to false
+    if item 1 of argv is "split" then
+      split (focused terminal of selected tab of front window) direction right with configuration cfg
+    else
+      new tab in front window with configuration cfg
+    end if
+  end tell
+end run
+"""
+
+
+def elsewhere(where, args):
+    """Run the picker in a Ghostty tab or split and wait for its answer."""
+    if sys.platform != "darwin" or not shutil.which("osascript"):
+        die("hue-pick: --tab and --split need Ghostty on macOS")
+    d = tempfile.mkdtemp(prefix="hue-pick.")
+    answer = os.path.join(d, "answer")
+    me = os.path.realpath(__file__)
+    cmd = " ".join(shlex.quote(a) for a in [sys.executable, me, "--answer", answer] + args)
+    r = subprocess.run(["osascript", "-e", APPLESCRIPT, where, cmd], capture_output=True, text=True)
+    if r.returncode:
+        shutil.rmtree(d, ignore_errors=True)
+        die("hue-pick: could not open a Ghostty %s: %s" % (where, r.stderr.strip()))
+    try:
+        t0 = time.time()
+        while not os.path.exists(answer):
+            if not os.path.exists(answer + ".started") and time.time() - t0 > 10:
+                die("hue-pick: the picker %s never started" % where)
+            time.sleep(0.1)
+        with open(answer) as f:
+            return f.read().rstrip("\n") or None
+    except KeyboardInterrupt:
+        return None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# --- check ------------------------------------------------------------------
+
+def check(argv):
+    """Fail on a bad entry; name the hues that come close; optionally draw a sheet."""
+    hues, path = load_hues()
+    html_out = argv[argv.index("--html") + 1] if "--html" in argv and argv.index("--html") + 1 < len(argv) else None
+    bad, names = [], set()
+    for h in hues:
+        n = h.get("name", "?")
+        if n in names:
+            bad.append(f"{n}: named twice")
+        names.add(n)
+        if not isinstance(h.get("hue"), (int, float)):
+            bad.append(f"{n}: hue is not a number")
+        lo_hi = h.get("light")
+        if not (isinstance(lo_hi, list) and len(lo_hi) == 2 and 0 <= lo_hi[0] < lo_hi[1] <= 100):
+            bad.append(f"{n}: light is not [low, high]")
+        xs = h.get("xterm", [])
+        if len(xs) != XTERM_STEPS or not all(norm(v) == v.lower() for v in xs):
+            bad.append(f"{n}: xterm is not {XTERM_STEPS} hex colours")
+            continue
+        if any(lab(b)[0] <= lab(a)[0] for a, b in zip(xs, xs[1:])):
+            bad.append(f"{n}: xterm steps do not run dark to light")
+        near = min(delta(a, b) for a, b in zip(xs, xs[1:]))
+        if near < CLOSE:
+            bad.append(f"{n}: two xterm steps look alike (ΔE {near:.1f})")
+    every = [v for h in hues for v in h.get("xterm", [])]
+    bad += [f"{v}: in two hues" for v in sorted(set(every)) if every.count(v) > 1]
+    print(f"{len(hues)} hues in {path}")
+    for line in bad:
+        print("  bad: " + line)
+    close = sorted((min(delta(a, b) for a in x["xterm"] for b in y["xterm"]), x["name"], y["name"])
+                   for x, y in itertools.combinations(hues, 2))
+    print("closest pairs in xterm-256, which read best kept apart:")
+    for d, a, b in close[:6]:
+        print(f"  {a} and {b}: ΔE {d:.1f}")
+    if html_out:
+        rows = []
+        for h in hues:
+            full = family(h, "full", XTERM_STEPS, 90)
+            sw = lambda cs: "".join(f'<span style="background:{c}" title="{c}"></span>' for c in cs)
+            rows.append(f'<tr><th>{h["name"]}<small>{h["hue"]}° · light {h["light"][0]}-{h["light"][1]}</small></th>'
+                        f'<td>{sw(h["xterm"])}</td><td>{sw(full)}</td></tr>')
+        write_atomic(html_out, SHEET.replace("ROWS", "\n".join(rows)))
+        print(f"sheet: {html_out}")
+    sys.exit(1 if bad else 0)
+
+
+SHEET = """<!doctype html><meta charset="utf-8"><title>hue-pick hues</title>
+<style>body{background:#16171c;color:#d6d9e0;font:14px ui-monospace,Menlo,monospace;padding:24px}
+table{border-spacing:0 6px}th{text-align:left;padding-right:16px;font-weight:600}th small{display:block;color:#888;font-weight:400}
+td{padding-right:24px}span{display:inline-block;width:56px;height:34px}h1{font-size:16px}</style>
+<h1>hue-pick · every hue · xterm-256 on the left, full colour on the right</h1><table>ROWS</table>"""
+
+
+# --- main ---------------------------------------------------------------------
+
+def die(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(2)
+
+
+def parse(argv):
+    opts = {"title": None, "hues": None, "steps": None, "mode": None, "strength": None, "format": "json",
+            "out": None, "print": False, "where": None, "nested": False, "answer": None, "assign": None}
+    takes = {"-t": "title", "--title": "title", "--hues": "hues", "-s": "steps", "--steps": "steps",
+             "--strength": "strength", "-f": "format", "--format": "format", "-o": "out", "--out": "out",
+             "--answer": "answer", "--assign": "assign"}
+    rest, i = [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            print(__doc__.strip())
+            sys.exit(0)
+        if a == "--list":
+            for h in load_hues()[0]:
+                print(f'{h["name"]:<8} {h["hue"]:>3}°  light {h["light"][0]}-{h["light"][1]}  {" ".join(h["xterm"])}')
+            sys.exit(0)
+        if "=" in a and a.split("=", 1)[0] in takes:
+            a, val = a.split("=", 1)
+            argv = argv[:i] + [a, val] + argv[i + 1:]
+        if a in takes:
+            if i + 1 >= len(argv):
+                die(f"hue-pick: {a} needs a value")
+            opts[takes[a]] = argv[i + 1]
+            if takes[a] != "answer":
+                rest += [a, argv[i + 1]]
+            i += 2
+            continue
+        if a in ("--tab", "--split"):
+            opts["where"] = a[2:]
+        elif a in ("-x", "--xterm", "--full"):
+            opts["mode"] = "full" if a == "--full" else "xterm"
+            rest.append(a)
+        elif a in ("--print", "--nested"):
+            opts[a[2:]] = True
+            rest.append(a)
+        else:
+            die(f"hue-pick: unknown option {a} · try --help")
+        i += 1
+    if opts["format"] not in ("json", "hex", "css"):
+        die("hue-pick: --format is json, hex or css")
+    return opts, rest
+
+
+def build(opts):
+    hues, _ = load_hues()
+    names = [h["name"] for h in hues]
+    s = dict(chosen=["red", "teal", "violet"], mode="full", steps=5, strength=90)
+    last = load_json(LAST)
+    if isinstance(last.get("chosen"), list):
+        s.update({k: last[k] for k in s if k in last})
+    if opts["hues"]:
+        s["chosen"] = [v.strip() for v in opts["hues"].split(",") if v.strip()]
+        unknown = [v for v in s["chosen"] if v not in names]
+        if unknown:
+            die(f"hue-pick: no hue {unknown[0]} · try --list")
+    if opts["mode"]:
+        s["mode"] = opts["mode"]
+    if opts["steps"]:
+        if not opts["steps"].isdigit() or not 1 <= int(opts["steps"]) <= FULL_STEPS:
+            die(f"hue-pick: --steps is 1 to {FULL_STEPS}")
+        s["steps"] = int(opts["steps"])
+    if opts["strength"]:
+        if not opts["strength"].isdigit():
+            die("hue-pick: --strength is a number, 60 to 100")
+        s["strength"] = int(opts["strength"])
+    chosen = [n for n in s["chosen"] if n in names][:MAX_HUES]
+    strength = max(STRENGTH[0], min(STRENGTH[1], int(s["strength"])))
+    return Palette(hues, chosen, s["mode"] if s["mode"] in ("xterm", "full") else "full",
+                   max(1, min(FULL_STEPS, int(s["steps"]))), strength)
+
+
+def main():
+    if sys.argv[1:2] == ["check"]:
+        check(sys.argv[2:])
+    opts, rest = parse(sys.argv[1:])
+    if opts["where"]:
+        result = elsewhere(opts["where"], [a for a in rest if a != "--nested"])
+    elif opts["assign"]:
+        raw = opts["assign"]
+        try:
+            if raw == "-":
+                raw = sys.stdin.read()
+            elif raw.startswith("@"):
+                with open(raw[1:]) as f:
+                    raw = f.read()
+            spec = json.loads(raw)
+            assert isinstance(spec.get("groups"), list)
+        except OSError as e:
+            die(f"hue-pick: cannot read {raw[1:]}: {e.strerror}")
+        except (ValueError, AssertionError, AttributeError):
+            die("hue-pick: --assign takes JSON, '-' for stdin or @file: {\"groups\": [{\"key\": ..., \"hue\": ..., \"n\": ...}]}")
+        hues, _ = load_hues()
+        if opts["steps"]:
+            spec["steps"] = opts["steps"]
+        model = Assignment(hues, spec)
+        if opts["print"]:
+            print(model.text())
+            if opts["out"]:
+                write_atomic(opts["out"], model.text() + "\n")
+            return
+        try:
+            open("/dev/tty").close()
+        except OSError:
+            die("hue-pick: needs a terminal · or use --print")
+        signal.signal(signal.SIGHUP, lambda *_: sys.exit(1))
+        result = None
+        if opts["answer"]:
+            write_atomic(opts["answer"] + ".started", "")
+        try:
+            result = AssignApp(model, opts["title"], opts["out"], opts["nested"]).run()
+        finally:
+            if opts["answer"]:
+                write_atomic(opts["answer"], (result or "") + "\n")
+    else:
+        p = build(opts)
+        if opts["print"]:
+            print(p.formatted(opts["format"]))
+            if opts["out"]:
+                write_atomic(opts["out"], p.formatted("json") + "\n")
+            return
+        try:
+            open("/dev/tty").close()
+        except OSError:
+            die("hue-pick: needs a terminal · or use --print")
+        signal.signal(signal.SIGHUP, lambda *_: sys.exit(1))
+        result = None
+        if opts["answer"]:
+            write_atomic(opts["answer"] + ".started", "")
+        try:
+            result = App(p, opts["title"], opts["format"], opts["out"], opts["nested"]).run()
+        finally:
+            if opts["answer"]:
+                write_atomic(opts["answer"], (result or "") + "\n")
+    if not result:
+        sys.exit(1)
+    print(result)
+
+
+if __name__ == "__main__":
+    main()

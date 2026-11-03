@@ -1,0 +1,16 @@
+{
+  "_about": "hue-pick's hues. Each one is a family: hue is its OKLCH angle, light is the lightness range its full-colour steps span, and xterm is five hand-checked xterm-256 colours, darkest first. Add a hue by adding an entry, then run `hue-pick check`.",
+  "hues": [
+    {"name": "red",    "hue": 29,  "light": [40, 76], "xterm": ["#870000", "#af0000", "#d70000", "#ff5f5f", "#ff8787"]},
+    {"name": "orange", "hue": 58,  "light": [52, 88], "xterm": ["#af5f00", "#d75f00", "#ff8700", "#ffaf5f", "#ffd7af"]},
+    {"name": "gold",   "hue": 90,  "light": [52, 90], "xterm": ["#875f00", "#af8700", "#d7af00", "#ffd700", "#ffff5f"]},
+    {"name": "lime",   "hue": 125, "light": [56, 92], "xterm": ["#5f8700", "#87af00", "#afd700", "#d7ff5f", "#d7ffaf"]},
+    {"name": "green",  "hue": 145, "light": [42, 88], "xterm": ["#005f00", "#008700", "#00af00", "#00d75f", "#5fff87"]},
+    {"name": "teal",   "hue": 195, "light": [44, 90], "xterm": ["#005f5f", "#008787", "#00afaf", "#00d7d7", "#00ffff"]},
+    {"name": "sky",    "hue": 236, "light": [46, 90], "xterm": ["#005f87", "#0087af", "#00afff", "#5fd7ff", "#afffff"]},
+    {"name": "blue",   "hue": 263, "light": [40, 84], "xterm": ["#0000d7", "#005fff", "#5f87ff", "#87afff", "#afd7ff"]},
+    {"name": "violet", "hue": 296, "light": [40, 82], "xterm": ["#5f00af", "#8700d7", "#875fff", "#af87ff", "#d7afff"]},
+    {"name": "plum",   "hue": 328, "light": [42, 86], "xterm": ["#870087", "#af00af", "#d700d7", "#ff5fff", "#ffafff"]},
+    {"name": "pink",   "hue": 350, "light": [40, 80], "xterm": ["#87005f", "#af0087", "#d70087", "#ff5faf", "#ff87d7"]}
+  ]
+}

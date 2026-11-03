@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""ghostty-config — the Ghostty settings worth changing, kept as presets.
+
+A preset is a Ghostty config fragment. Using one writes it to
+~/.local/state/ghostty-config/active.conf, and your Ghostty config loads
+that file through one line, `config-file = ?<path>`, added on first use.
+A setting the preset leaves unset keeps your config's value.
+
+The theme row lists your themes and Ghostty's, and this window repaints
+as you move through them. `c` on that row opens ghostty-theme-edit, the
+colour tree, on the theme. New windows take a pick, and ⌘⇧, reloads the
+open ones.
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+from preset_kit import BG, DIM, FG, HEX, Element, Tool, main, sibling  # noqa: E402
+
+HOME = os.path.expanduser("~")
+CONFIG = os.environ.get("GHOSTTY_CONFIG", os.path.join(HOME, ".config", "ghostty", "config"))
+THEMES = os.environ.get("GHOSTTY_THEMES_DIR", os.path.join(HOME, ".config", "ghostty", "themes"))
+# Ghostty sets GHOSTTY_RESOURCES_DIR in its own terminals.
+RESOURCES = [d for d in (os.environ.get("GHOSTTY_RESOURCES_DIR"),
+                         "/Applications/Ghostty.app/Contents/Resources/ghostty",
+                         "/usr/share/ghostty") if d]
+
+TF = ("true", "false")
+LINE = re.compile(r"^\s*([A-Za-z0-9-]+)\s*=\s*(.*?)\s*$")
+COLOR_KEYS = ("background", "foreground", "cursor-color", "cursor-text",
+              "selection-background", "selection-foreground")
+# OSC numbers that set each colour in a running terminal.
+OSC = {"foreground": 10, "background": 11, "cursor-color": 12,
+       "selection-background": 17, "selection-foreground": 19}
+RESET_ALL = "\x1b]104\a\x1b]110\a\x1b]111\a\x1b]112\a\x1b]117\a\x1b]119\a"
+# Keybinds the Keys group can switch on. Each value is a trigger.
+KEYBINDS = {"kb-quick-terminal": "toggle_quick_terminal"}
+
+
+# --- reading Ghostty's files ----------------------------------------------------
+
+def read_config(path):
+    """key -> value, the last assignment winning, as Ghostty does."""
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                m = LINE.match(line)
+                if m and not line.lstrip().startswith("#"):
+                    out[m.group(1)] = m.group(2).strip('"')
+    except OSError:
+        pass
+    return out
+
+
+def theme_file(name):
+    for d in [THEMES] + [os.path.join(r, "themes") for r in RESOURCES]:
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def theme_colours(name):
+    """A theme's colours: the COLOR_KEYS plus palette:0 to palette:15."""
+    # "light:A,dark:B" picks a theme per system appearance. Show the dark one.
+    if name and "," in name:
+        parts = dict(p.split(":", 1) for p in name.split(",") if ":" in p)
+        name = parts.get("dark") or parts.get("light")
+    path = theme_file(name) if name else None
+    out = {}
+    if not path:
+        return out
+    with open(path) as f:
+        for line in f:
+            m = LINE.match(line)
+            if not m:
+                continue
+            key, val = m.groups()
+            if key == "palette":
+                n, _, val = val.partition("=")
+                key = f"palette:{n.strip()}"
+            val = val.strip()
+            val = val if val.startswith("#") else "#" + val
+            if HEX.fullmatch(val):
+                out[key] = val.lower()
+    return out
+
+
+def theme_names():
+    mine = sorted(n for n in os.listdir(THEMES) if not n.startswith(".")) if os.path.isdir(THEMES) else []
+    theirs = []
+    for r in RESOURCES:
+        d = os.path.join(r, "themes")
+        if os.path.isdir(d):
+            theirs = sorted((n for n in os.listdir(d) if n not in mine), key=str.lower)
+            break
+    return mine + theirs
+
+
+_fonts = None
+
+
+def font_names():
+    global _fonts
+    if _fonts is None:
+        try:
+            r = subprocess.run(["ghostty", "+list-fonts"], capture_output=True, text=True, timeout=10)
+            _fonts = sorted({ln.strip() for ln in r.stdout.splitlines() if ln and not ln[0].isspace()})
+        except (OSError, subprocess.TimeoutExpired):
+            _fonts = []
+    return _fonts
+
+
+_defaults = None
+
+
+def ghostty_defaults():
+    global _defaults
+    if _defaults is None:
+        _defaults = {}
+        try:
+            r = subprocess.run(["ghostty", "+show-config", "--default"],
+                               capture_output=True, text=True, timeout=10)
+            for line in r.stdout.splitlines():
+                k, _, v = line.partition(" = ")
+                _defaults.setdefault(k, v.strip())
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return _defaults
+
+
+def edit_colours(tool, theme):
+    """The colour tree: ghostty-theme-edit on the theme in use. A theme that
+    ships with Ghostty is copied into your themes first, so it can change."""
+    name = theme or read_config(CONFIG).get("theme")
+    gte = sibling("ghostty-theme-edit")
+    if not gte or not name:
+        return None
+    src = theme_file(name)
+    if src and not src.startswith(THEMES):
+        os.makedirs(THEMES, exist_ok=True)
+        shutil.copy(src, os.path.join(THEMES, name))
+    subprocess.run([gte, name])
+    return None
+
+
+# --- the tool -------------------------------------------------------------------
+
+def el(key, label, group, kind, **kw):
+    return Element(key, label, kind=kind, group=group, optional=True, **kw)
+
+
+class GhosttyConfig(Tool):
+    name = "ghostty-config"
+    title = "Ghostty's look and feel, as presets"
+    pickup = "new windows take it · ⌘⇧, reloads open ones"
+    list_shows = False   # the preview already prints the fragment
+    elements = (
+        el("theme", "theme", "Theme", "choice", choices=theme_names,
+           actions={"c": ("edit colours", edit_colours)}),
+        el("background", "background", "Theme", "color"),
+        el("foreground", "foreground", "Theme", "color"),
+        el("background-opacity", "opacity", "Theme", "number", lo=0.3, hi=1, step=0.05, default=1),
+        el("background-blur", "blur", "Theme", "number", lo=0, hi=40, step=1, default=0),
+        el("unfocused-split-opacity", "unfocused split", "Theme", "number",
+           lo=0.15, hi=1, step=0.05, default=0.7),
+        el("minimum-contrast", "minimum contrast", "Theme", "number", lo=1, hi=21, step=0.5, default=1),
+        el("font-family", "family", "Font", "choice", choices=font_names),
+        el("font-size", "size", "Font", "number", lo=6, hi=36, step=0.5, default=13),
+        el("font-thicken", "thicken", "Font", "choice", choices=TF),
+        el("adjust-cell-height", "cell height", "Font", "choice",
+           choices=("0%", "5%", "10%", "15%", "20%", "30%")),
+        el("window-padding-x", "padding x", "Window", "number", lo=0, hi=64, step=2, default=2),
+        el("window-padding-y", "padding y", "Window", "number", lo=0, hi=64, step=2, default=2),
+        el("window-padding-balance", "balance padding", "Window", "choice", choices=TF),
+        el("macos-titlebar-style", "titlebar", "Window", "choice",
+           choices=("native", "transparent", "tabs", "hidden")),
+        el("window-decoration", "decorations", "Window", "choice", choices=("auto", "none")),
+        el("window-theme", "window theme", "Window", "choice",
+           choices=("auto", "system", "light", "dark", "ghostty")),
+        el("window-save-state", "restore windows", "Window", "choice", choices=("default", "never", "always")),
+        el("cursor-style", "style", "Cursor", "choice", choices=("block", "bar", "underline", "block_hollow")),
+        el("cursor-style-blink", "blink", "Cursor", "choice", choices=TF),
+        el("cursor-color", "colour", "Cursor", "color"),
+        el("cursor-opacity", "opacity", "Cursor", "number", lo=0, hi=1, step=0.05, default=1),
+        el("copy-on-select", "copy on select", "Mouse and clipboard", "choice",
+           choices=("false", "true", "clipboard")),
+        el("mouse-hide-while-typing", "hide mouse while typing", "Mouse and clipboard", "choice", choices=TF),
+        el("confirm-close-surface", "confirm close", "Mouse and clipboard", "choice",
+           choices=("true", "false", "always")),
+        el("scrollback-limit", "scrollback bytes", "Mouse and clipboard", "choice",
+           choices=("1000000", "10000000", "100000000")),
+        el("kb-quick-terminal", "quick terminal key", "Keys", "choice",
+           choices=("global:cmd+grave_accent", "global:ctrl+grave_accent", "global:cmd+shift+space")),
+        el("quick-terminal-position", "quick terminal at", "Keys", "choice",
+           choices=("top", "bottom", "left", "right", "center")),
+    )
+    builtins = {
+        "default": {},
+        "focus": {"set": {"macos-titlebar-style": "hidden", "window-padding-x": 16, "window-padding-y": 12,
+                          "cursor-style": "bar", "unfocused-split-opacity": 0.6,
+                          "mouse-hide-while-typing": "true"}},
+        "present": {"set": {"font-size": 18, "window-padding-x": 24, "window-padding-y": 16,
+                            "window-padding-balance": "true", "cursor-style-blink": "false"}},
+        "glass": {"set": {"background-opacity": 0.85, "background-blur": 20,
+                          "macos-titlebar-style": "transparent"}},
+    }
+
+    @property
+    def fragment_path(self):
+        return os.path.join(self.state_dir, "active.conf")
+
+    def base(self):
+        return read_config(CONFIG)
+
+    def value(self, key):
+        """What an unset setting falls back to: your config, else Ghostty."""
+        v = self.base().get(key)
+        if v is not None:
+            return v
+        d = ghostty_defaults().get(key)
+        return f"default {d}" if d else ""
+
+    def effective(self, preset):
+        """Each setting as a window would get it: the preset, your config,
+        then Ghostty's default."""
+        base, dflt = self.base(), ghostty_defaults()
+        out = {}
+        for e in self.elements:
+            v = preset["set"].get(e.key)
+            out[e.key] = v if v is not None else base.get(e.key, dflt.get(e.key) or None)
+        return out
+
+    def colours(self, preset):
+        """The colours a window would wear: the theme's, then any set here."""
+        eff = self.effective(preset)
+        out = theme_colours(eff["theme"])
+        for k in ("background", "foreground", "cursor-color"):
+            if preset["set"].get(k):
+                out[k] = preset["set"][k]
+        return out
+
+    def fragment(self, preset, name=""):
+        lines = []
+        for e in self.elements:
+            v = preset["set"].get(e.key)
+            if v is None:
+                continue
+            if e.key in KEYBINDS:
+                lines.append(f"keybind = {v}={KEYBINDS[e.key]}")
+            else:
+                lines.append(f"{e.key} = {v}")
+        return lines
+
+    # --- hooks ----------------------------------------------------------------
+
+    def applied(self, name, preset):
+        os.makedirs(self.state_dir, exist_ok=True)
+        head = [f"# ghostty-config preset: {name}",
+                "# Written by ghostty-config. Edit the preset there, not this file."]
+        tmp = self.fragment_path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write("\n".join(head + self.fragment(preset)) + "\n")
+        os.replace(tmp, self.fragment_path)
+        self.include()
+
+    def include(self):
+        """Add the one config-file line to the Ghostty config, once. The
+        write goes through a symlink, so a dotfiles repo sees a plain edit."""
+        want = f"config-file = ?{self.fragment_path}"
+        try:
+            with open(CONFIG) as f:
+                text = f.read()
+        except OSError:
+            text = ""
+        if want in text:
+            return
+        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+        with open(CONFIG, "a") as f:
+            f.write(("" if text.endswith("\n") or not text else "\n")
+                    + "\n# The preset in use, from ghostty-config.\n" + want + "\n")
+
+    def live(self, preset):
+        sets = []
+        for k, v in self.colours(preset).items():
+            if k.startswith("palette:"):
+                sets.append(f"\x1b]4;{k[8:]};{v}\a")
+            elif k in OSC:
+                sets.append(f"\x1b]{OSC[k]};{v}\a")
+        self.osc(RESET_ALL + "".join(sets))
+
+    def restore(self):
+        self.osc(RESET_ALL)
+
+    def osc(self, s):
+        try:
+            fd = os.open("/dev/tty", os.O_WRONLY)
+            os.write(fd, s.encode())
+            os.close(fd)
+        except OSError:
+            pass
+
+    # --- preview --------------------------------------------------------------
+
+    def render(self, preset, width):
+        c = self.colours(preset)
+        eff = self.effective(preset)
+        bg, fg = c.get("background", "#1d1f21"), c.get("foreground", "#c5c8c6")
+        w = min(width, 46)
+
+        def pal(n):
+            return c.get(f"palette:{n}", fg)
+
+        def row(*parts):
+            text, out = "", BG(bg)
+            for s, col in parts:
+                out += FG(col) + s
+                text += s
+            return out + " " * max(0, w - len(text)) + "\x1b[0m"
+
+        out = [row(),
+               row((" ~/dotfiles ", pal(2)), ("git:(", pal(4)), ("main", pal(1)), (")", pal(4))),
+               row((" $ ls", fg)),
+               row((" bin/  config/  ", pal(4)), ("setup.sh  ", pal(2)), ("README", fg)),
+               row((" $ make test", fg)),
+               row((" ok 12", pal(10)), ("  ", fg), ("fail 1", pal(9)), ("  ", fg), ("skip 2", pal(11))),
+               row((" # bright black for comments", pal(8))),
+               row((" ==> ", pal(5)), ("reloaded in ", fg), ("0.2s", pal(6))),
+               row()]
+        sw = max(2, min(5, w // 8))
+        for half in (0, 1):
+            out.append("".join(BG(pal(half * 8 + j)) + " " * sw for j in range(8)) + "\x1b[0m")
+
+        def said(k, unit=""):
+            v = eff.get(k)
+            return "–" if v is None else f"{v}{unit}"
+        out += ["",
+                f"{DIM}theme{chr(27)}[0m   {said('theme')}",
+                f"{DIM}font{chr(27)}[0m    {said('font-family')} {said('font-size')}"
+                f" · cell {said('adjust-cell-height')}",
+                f"{DIM}window{chr(27)}[0m  padding {said('window-padding-x')}×{said('window-padding-y')}"
+                f" · titlebar {said('macos-titlebar-style')} · opacity {said('background-opacity')}",
+                f"{DIM}cursor{chr(27)}[0m  {said('cursor-style')} · blink {said('cursor-style-blink')}",
+                ""]
+        frag = self.fragment(preset)
+        out.append(DIM + ("fragment" if frag else "fragment · empty, so your config as is") + "\x1b[0m")
+        out += ["  " + ln for ln in frag]
+        return out
+
+
+if __name__ == "__main__":
+    main(GhosttyConfig(), sys.argv[1:])

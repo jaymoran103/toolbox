@@ -1,0 +1,16 @@
+{
+  "name": "starship-preset",
+  "about": "pick a Starship prompt config, everywhere or per project",
+  "template": "preset-kit (to move onto)",
+  "entries": [
+    "bin/starship-preset"
+  ],
+  "links": {
+    "presets/starship-preset": "~/.config/starship/presets",
+    "tools/starship-preset/starship-preset.zsh": "~/.config/starship/starship-preset.zsh"
+  },
+  "needs": [
+    "starship",
+    "fzf"
+  ]
+}

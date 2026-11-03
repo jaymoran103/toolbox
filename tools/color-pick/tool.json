@@ -1,0 +1,12 @@
+{
+  "name": "color-pick",
+  "about": "pick one colour, get its hex",
+  "template": "picker contract",
+  "entries": [
+    "bin/color-pick"
+  ],
+  "links": {},
+  "needs": [
+    "python3"
+  ]
+}

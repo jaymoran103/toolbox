@@ -1,0 +1,873 @@
+#!/usr/bin/env python3
+"""ghostty-theme-edit — build a new Ghostty colour scheme or change one.
+
+  ghostty-theme-edit           theme list: open one, or start a new one
+  ghostty-theme-edit <name>    open <name>, or start it if it is new
+  ghostty-theme -e [<name>]    the same, through the picker
+
+Three levels: the theme list, a tree of the theme's elements in groups,
+and a colour picker for one element. Enter opens a theme or a colour,
+and Enter on the picker closes it with the change kept. Esc goes back
+up a level, and on the picker it undoes the change first.
+
+Every change repaints this window with OSC escapes as you make it, so
+the editor itself is the preview. Leaving puts the config's theme back.
+s writes the file into the themes directory and keeps every line it
+does not manage. a saves, then hands the name to `ghostty-theme <name>`
+so the config uses it.
+
+A risky key does nothing on its first press while changes are unsaved.
+It says what a second press does. Any other key cancels.
+"""
+
+import colorsys
+import os
+import re
+import select
+import shutil
+import subprocess
+import sys
+import termios
+import tty
+
+HOME = os.path.expanduser("~")
+CONFIG = os.environ.get("GHOSTTY_CONFIG", os.path.join(HOME, ".config", "ghostty", "config"))
+THEMES = os.environ.get("GHOSTTY_THEMES_DIR", os.path.join(HOME, ".config", "ghostty", "themes"))
+
+NAMES = ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white")
+GROUPS = (
+    ("Base", (("background", "background"), ("foreground", "foreground"))),
+    ("Cursor", (("cursor-color", "cursor"), ("cursor-text", "cursor text"))),
+    ("Selection", (("selection-background", "selection bg"),
+                   ("selection-foreground", "selection fg"))),
+    ("Normal", tuple((f"palette:{i}", n) for i, n in enumerate(NAMES))),
+    ("Bright", tuple((f"palette:{i + 8}", "bright " + n) for i, n in enumerate(NAMES))),
+)
+ORDER = tuple(k for _, items in GROUPS for k, _ in items)
+LABEL = {k: label for _, items in GROUPS for k, label in items}
+GROUP_OF = {k: gi for gi, (_, items) in enumerate(GROUPS) for k, _ in items}
+
+# OSC numbers that set and reset each key. cursor-text has none, so it
+# shows in the mock panel only.
+OSC = {"foreground": (10, 110), "background": (11, 111), "cursor-color": (12, 112),
+       "selection-background": (17, 117), "selection-foreground": (19, 119)}
+RESET_ALL = "\x1b]104\a\x1b]110\a\x1b]111\a\x1b]112\a\x1b]117\a\x1b]119\a"
+
+# A new theme starts from the config's theme. This is for when there is none.
+FALLBACK = {
+    "background": "#1d1f21", "foreground": "#c5c8c6",
+    "cursor-color": "#c5c8c6", "cursor-text": "#1d1f21",
+    "selection-background": "#373b41", "selection-foreground": "#c5c8c6",
+    **{f"palette:{i}": v for i, v in enumerate((
+        "#1d1f21", "#cc6666", "#b5bd68", "#f0c674", "#81a2be", "#b294bb", "#8abeb7", "#c5c8c6",
+        "#666666", "#d54e53", "#b9ca4a", "#e7c547", "#7aa6da", "#c397d8", "#70c0b1", "#eaeaea"))},
+}
+
+# The mock terminal on the right. A spec is "fg", a palette slot, "sel"
+# for the selection pair or "cur" for the cursor pair.
+MOCK = (
+    (),
+    ((" ~/dotfiles ", 2), ("git:(", 4), ("main", 1), (")", 4)),
+    ((" $ ls", "fg"),),
+    ((" bin/  config/  ", 4), ("setup.sh  ", 2), ("README", "fg")),
+    ((" $ make test", "fg"),),
+    ((" ok 12", 10), ("  ", "fg"), ("fail 1", 9), ("  ", "fg"), ("skip 2", 11)),
+    ((" # bright black for comments", 8),),
+    ((" ==> ", 5), ("reloaded in ", "fg"), ("0.2s", 6)),
+    ((" $ echo ", "fg"), ("selected", "sel"), (" and ", "fg"), ("c", "cur"), ("ursor", "fg")),
+    (),
+)
+
+MIN_W, MIN_H = 72, 20
+MAX_W, MAX_H = 110, 36  # a bigger window centres the frame, not stretch it
+BOLD, DIM, REV = "\x1b[1m", "\x1b[2m", "\x1b[7m"
+RED, YELLOW = "\x1b[31m", "\x1b[33m"
+
+
+# --- colour ----------------------------------------------------------------
+
+def rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def hexof(r, g, b):
+    return "#%02x%02x%02x" % (r, g, b)
+
+
+def hsl_hex(h, s, l):
+    r, g, b = colorsys.hls_to_rgb(h / 360, l / 100, s / 100)
+    return hexof(round(r * 255), round(g * 255), round(b * 255))
+
+
+def FG(h):
+    return "\x1b[38;2;%d;%d;%dm" % rgb(h)
+
+
+def BG(h):
+    return "\x1b[48;2;%d;%d;%dm" % rgb(h)
+
+
+def lum(h):
+    r, g, b = rgb(h)
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
+
+def ink(h):
+    """Black or white, whichever reads on h."""
+    return "#000000" if lum(h) > 140 else "#ffffff"
+
+
+def norm(v):
+    v = v.strip().strip('"').lstrip("#")
+    return "#" + v.lower() if re.fullmatch(r"[0-9a-fA-F]{6}", v) else None
+
+
+def osc(key, val):
+    if key.startswith("palette:"):
+        n = key[8:]
+        return f"\x1b]4;{n};{val}\a" if val else f"\x1b]104;{n}\a"
+    if key not in OSC:
+        return ""
+    on, off = OSC[key]
+    return f"\x1b]{on};{val}\a" if val else f"\x1b]{off}\a"
+
+
+# --- theme files -------------------------------------------------------------
+
+LINE = re.compile(r"^\s*([A-Za-z0-9-]+)\s*=\s*(.*?)\s*$")
+SLOT = re.compile(r"^(\d+)\s*=\s*(.+)$")
+
+
+def entry(key, val):
+    if key.startswith("palette:"):
+        return f"palette = {key[8:]}={val}"
+    return f"{key} = {val}"
+
+
+class Theme:
+    """One file in the themes directory. Lines it does not manage pass
+    through a save untouched."""
+
+    def __init__(self, name, lines=()):
+        self.name = name
+        self.parse(list(lines))
+        self.saved = dict(self.colors)
+
+    @classmethod
+    def load(cls, name):
+        try:
+            with open(os.path.join(THEMES, name)) as f:
+                return cls(name, f.read().splitlines())
+        except OSError:
+            return cls(name)
+
+    def parse(self, lines):
+        self.lines, self.colors, self.slots = lines, {}, []
+        for i, line in enumerate(lines):
+            m = LINE.match(line)
+            if not m:
+                continue
+            key, val = m.groups()
+            if key == "palette":
+                p = SLOT.match(val)
+                if not p or int(p.group(1)) > 15:
+                    continue
+                key, val = f"palette:{int(p.group(1))}", p.group(2)
+            if key in LABEL and norm(val):
+                self.colors[key] = norm(val)
+                self.slots.append((i, key))
+
+    @property
+    def path(self):
+        return os.path.join(THEMES, self.name)
+
+    @property
+    def dirty(self):
+        return self.colors != self.saved or not os.path.exists(self.path)
+
+    def copy(self, name):
+        t = Theme(name, self.lines)
+        t.colors, t.saved = dict(self.colors), {}
+        return t
+
+    def text(self):
+        out, seen = list(self.lines), set()
+        for i, key in self.slots:
+            val = self.colors.get(key)
+            out[i] = entry(key, val) if val else None
+            seen.add(key)
+        out = [line for line in out if line is not None]
+        out += [entry(k, self.colors[k]) for k in ORDER if k not in seen and self.colors.get(k)]
+        return "\n".join(out) + "\n"
+
+    def save(self):
+        text = self.text()
+        os.makedirs(THEMES, exist_ok=True)
+        with open(self.path, "w") as f:      # writes through a symlink
+            f.write(text)
+        self.parse(text.splitlines())
+        self.saved = dict(self.colors)
+
+
+def theme_names():
+    if not os.path.isdir(THEMES):
+        return []
+    return sorted(n for n in os.listdir(THEMES)
+                  if not n.startswith(".") and os.path.isfile(os.path.join(THEMES, n)))
+
+
+def config_theme():
+    name = None
+    try:
+        with open(CONFIG) as f:
+            for line in f:
+                m = LINE.match(line)
+                if m and m.group(1) == "theme":
+                    name = m.group(2)
+    except OSError:
+        pass
+    return name
+
+
+def ghostty_theme():
+    here = os.path.join(os.path.dirname(os.path.realpath(__file__)), "ghostty-theme")
+    return here if os.access(here, os.X_OK) else shutil.which("ghostty-theme")
+
+
+# --- picker -------------------------------------------------------------------
+
+class Picker:
+    CH = (("H", 359), ("S", 100), ("L", 100), ("R", 255), ("G", 255), ("B", 255))
+    COPY = len(CH)          # the last row steps through the theme's colours
+
+    def __init__(self, key, start, before, sources):
+        self.key, self.before, self.sources = key, before, sources
+        self.chan, self.copy = 0, -1
+        self.h = self.s = self.l = 0
+        self.set_hex(start)
+
+    def set_hex(self, val):
+        self.rgb = list(rgb(val))
+        h, l, s = colorsys.rgb_to_hls(*(c / 255 for c in self.rgb))
+        self.l = round(l * 100)
+        # Grey has no hue and black or white no saturation. Keep the old
+        # ones there, so a slider pulled through zero comes back intact.
+        if 0 < self.l < 100:
+            self.s = round(s * 100)
+            if s > 0:
+                self.h = round(h * 360) % 360
+
+    @property
+    def hex(self):
+        return hexof(*self.rgb)
+
+    def value(self, c):
+        return (self.h, self.s, self.l, *self.rgb)[c]
+
+    def with_value(self, c, v):
+        if c < 3:
+            hsl = [self.h, self.s, self.l]
+            hsl[c] = v
+            return hsl_hex(*hsl)
+        parts = list(self.rgb)
+        parts[c - 3] = v
+        return hexof(*parts)
+
+    def track(self, c, v):
+        """The colour a slider cell shows. Hue and saturation tracks lift a
+        grey toward full colour, so the choice ahead stays visible."""
+        if c == 0:
+            return hsl_hex(v, max(self.s, 50), max(30, min(70, self.l)))
+        if c == 1:
+            return hsl_hex(self.h, v, max(20, min(80, self.l)))
+        return self.with_value(c, v)
+
+    def set(self, c, v):
+        v = v % 360 if c == 0 else max(0, min(self.CH[c][1], v))
+        if c < 3:
+            hsl = [self.h, self.s, self.l]
+            hsl[c] = v
+            self.h, self.s, self.l = hsl
+            self.rgb = list(rgb(hsl_hex(*hsl)))
+        else:
+            self.rgb[c - 3] = v
+            self.set_hex(self.hex)
+
+
+# --- drawing --------------------------------------------------------------------
+
+class Canvas:
+    """A grid of (char, style) cells, flushed in one write so nothing tears."""
+
+    def __init__(self, w, h, base=""):
+        self.w, self.h, self.base = w, h, base
+        self.cells = [[(" ", "")] * w for _ in range(h)]
+
+    def put(self, y, x, text, style="", limit=None):
+        if not 0 <= y < self.h:
+            return
+        if limit is not None:
+            text = text[:max(0, limit)]
+        row = self.cells[y]
+        for i, ch in enumerate(text):
+            if 0 <= x + i < self.w:
+                row[x + i] = (ch, style)
+
+    def centred(self, w, h):
+        """This canvas in the middle of a w×h one."""
+        big = Canvas(w, h, self.base)
+        oy, ox = (h - self.h) // 2, (w - self.w) // 2
+        for y, row in enumerate(self.cells):
+            big.cells[oy + y][ox:ox + self.w] = row
+        return big
+
+    def render(self):
+        out = ["\x1b[H"]
+        for y, row in enumerate(self.cells):
+            style = None
+            for ch, st in row:
+                if st != style:
+                    out.append("\x1b[0m" + self.base + st)
+                    style = st
+                out.append(ch)
+            out.append("\x1b[0m")
+            if y < self.h - 1:
+                out.append("\r\n")
+        return "".join(out)
+
+
+def box(c, y, x, w, h, title, on):
+    st = "" if on else DIM
+    c.put(y, x, "╭" + "─" * (w - 2) + "╮", st)
+    for r in range(y + 1, y + h - 1):
+        c.put(r, x, "│", st)
+        c.put(r, x + w - 1, "│", st)
+    c.put(y + h - 1, x, "╰" + "─" * (w - 2) + "╯", st)
+    c.put(y, x + 2, f" {title} ", st + (BOLD if on else ""), limit=w - 4)
+
+
+def strip(c, y, x, colors, keys):
+    for i, k in enumerate(keys):
+        v = colors.get(k)
+        c.put(y, x + i, " " if v else "·", BG(v) if v else DIM)
+
+
+def preview(c, y, x, w, h, colors, mark=None):
+    # An unset key falls back to the window's own colours, as Ghostty does.
+    def pair(bg_key, fg_key):
+        b, f = colors.get(bg_key), colors.get(fg_key)
+        return (BG(b) if b else "") + (FG(f) if f else "") if b or f else REV
+
+    base = BG(colors["background"]) if colors.get("background") else ""
+    text_ink = FG(colors["foreground"]) if colors.get("foreground") else ""
+    for i, segs in enumerate(MOCK[:h]):
+        c.put(y + i, x, " " * w, base)
+        cx = x
+        for text, spec in segs:
+            if spec == "sel":
+                st = pair("selection-background", "selection-foreground")
+            elif spec == "cur":
+                st = pair("cursor-color", "cursor-text")
+            elif spec == "fg" or not colors.get(f"palette:{spec}"):
+                st = base + text_ink
+            else:
+                st = base + FG(colors[f"palette:{spec}"])
+            c.put(y + i, cx, text, st, limit=x + w - cx)
+            cx += len(text)
+
+    # Normal slots above bright ones, two cells tall when there is room.
+    sy, room = y + len(MOCK) + 1, h - len(MOCK) - 1
+    tall = 2 if room >= 4 else 1
+    sw = min(6, w // 8)
+    for half in (0, 1):
+        for r in range(tall):
+            yy = sy + half * tall + r
+            if yy >= y + h:
+                return
+            for j in range(8):
+                key = f"palette:{half * 8 + j}"
+                v = colors.get(key)
+                label = ""
+                if r == 0:
+                    label = ("•" if key == mark else " ") + str(half * 8 + j)
+                c.put(yy, x + j * sw, label.ljust(sw), BG(v) + FG(ink(v)) if v else DIM)
+
+
+# --- keys -----------------------------------------------------------------------
+
+SEQ = {"[A": "up", "[B": "down", "[C": "right", "[D": "left",
+       "OA": "up", "OB": "down", "OC": "right", "OD": "left",
+       "[1;2C": "S-right", "[1;2D": "S-left", "[1;2A": "up", "[1;2B": "down"}
+PLAIN = {"\r": "enter", "\n": "enter", "\x7f": "bs", "\x08": "bs", "\x03": "ctrl-c"}
+CSI = re.compile(r"\x1b(\[[0-9;]*[A-Za-z~]|O[A-Za-z])")
+
+
+def keys(data):
+    s, i = data.decode("utf-8", "ignore"), 0
+    while i < len(s):
+        m = CSI.match(s, i)
+        if m:
+            yield SEQ.get(m.group(1), "")
+            i = m.end()
+            continue
+        yield "esc" if s[i] == "\x1b" else PLAIN.get(s[i], s[i])
+        i += 1
+
+
+# --- app ------------------------------------------------------------------------
+
+class App:
+    def __init__(self, start=None):
+        self.tty = os.open("/dev/tty", os.O_RDWR)
+        self.config = config_theme()
+        self.names = theme_names()
+        self.cache = {}
+        self.mode, self.theme, self.pick = "list", None, None
+        self.li = self.names.index(self.config) + 1 if self.config in self.names else 0
+        self.ti = self.toff = self.loff = 0
+        self.folded = set()
+        self.prompt = self.msg = self.armed = None
+        self.done = False
+        if start in self.names:
+            self.edit(Theme.load(start))
+        elif start:
+            self.create(start, self.config_base())
+
+    # --- helpers --------------------------------------------------------------
+
+    def out(self, s):
+        os.write(self.tty, s.encode())
+
+    def paint(self, theme):
+        """Repaint the whole window as theme, or as the launch colours."""
+        sets = "".join(osc(k, v) for k, v in theme.colors.items() if v) if theme else ""
+        self.out(RESET_ALL + sets)
+
+    def setc(self, key, val):
+        if val:
+            self.theme.colors[key] = val
+        else:
+            self.theme.colors.pop(key, None)
+        self.out(osc(key, val))
+
+    def listed(self, i):
+        if i == 0:
+            return self.config_base()
+        name = self.names[i - 1]
+        if name not in self.cache:
+            self.cache[name] = Theme.load(name)
+        return self.cache[name]
+
+    def config_base(self):
+        return Theme.load(self.config) if self.config in self.names else None
+
+    def say(self, text, style=""):
+        self.msg = (text, style)
+
+    def risky(self, k, armed, then):
+        """True on the second press of k while there are unsaved changes."""
+        if not (self.theme and self.theme.dirty) or armed == k:
+            return True
+        self.armed = k
+        self.say(f"unsaved changes · {k} again to {then}", RED)
+        return False
+
+    def valid_new(self, name):
+        if not name or "/" in name or name.startswith("."):
+            self.say("use a plain file name", RED)
+        elif os.path.exists(os.path.join(THEMES, name)):
+            self.say(f"{name} already exists", RED)
+        else:
+            return True
+        return False
+
+    def fallback(self, key):
+        c = self.theme.colors
+        if key in ("cursor-text", "selection-foreground"):
+            return c.get("background") or "#000000"
+        if key.startswith("palette:") and int(key[8:]) >= 8:
+            return c.get(f"palette:{int(key[8:]) - 8}") or c.get("foreground") or "#808080"
+        return c.get("foreground") or "#808080"
+
+    def rows(self):
+        out = []
+        for gi, (_, items) in enumerate(GROUPS):
+            out.append(("group", gi))
+            if gi not in self.folded:
+                out += [("elem", k) for k, _ in items]
+        return out
+
+    def focus(self, row):
+        rows = self.rows()
+        if row not in rows:
+            row = ("group", GROUP_OF[row[1]])
+        self.ti = rows.index(row)
+
+    # --- actions --------------------------------------------------------------
+
+    def edit(self, theme):
+        self.theme, self.mode = theme, "tree"
+        self.ti = self.toff = 0
+        self.paint(theme)
+
+    def create(self, name, base):
+        if not self.valid_new(name):
+            return
+        if base:
+            self.edit(base.copy(name))
+        else:
+            t = Theme(name)
+            t.colors, t.saved = dict(FALLBACK), {}
+            self.edit(t)
+        self.say(f"new theme {name} · s writes it")
+
+    def save(self):
+        try:
+            self.theme.save()
+        except OSError as e:
+            self.say(f"save failed: {e.strerror}", RED)
+            return False
+        self.cache.pop(self.theme.name, None)
+        self.names = theme_names()
+        self.say(f"saved {self.theme.path.replace(HOME, '~', 1)}")
+        return True
+
+    def save_as(self, name):
+        name = name.strip()
+        if self.valid_new(name):
+            self.theme = self.theme.copy(name)
+            self.save()
+
+    def apply(self):
+        if self.theme.dirty and not self.save():
+            return
+        gt = ghostty_theme()
+        if not gt:
+            self.say("ghostty-theme not found on PATH", RED)
+            return
+        r = subprocess.run([gt, self.theme.name], capture_output=True, text=True)
+        if r.returncode:
+            self.say(r.stderr.strip() or "ghostty-theme failed", RED)
+            return
+        self.config = self.theme.name
+        self.say(f"saved and applied · theme = {self.theme.name}")
+
+    def back(self):
+        name = self.theme.name
+        self.names = theme_names()
+        self.theme, self.mode = None, "list"
+        if name in self.names:
+            self.li = self.names.index(name) + 1
+        self.li = min(self.li, len(self.names))
+        self.paint(self.listed(self.li))
+
+    # --- key handling ---------------------------------------------------------
+
+    def key(self, k):
+        if k == "ctrl-c":
+            self.done = True
+            return
+        if self.prompt:
+            self.prompt_key(k)
+            return
+        armed, self.armed, self.msg = self.armed, None, None
+        k = {"k": "up", "j": "down"}.get(k, k)
+        getattr(self, "key_" + self.mode)(k, armed)
+
+    def prompt_key(self, k):
+        label, text, then = self.prompt
+        if k == "esc":
+            self.prompt = None
+        elif k == "enter":
+            self.prompt = None
+            then(text)
+        elif k == "bs":
+            self.prompt[1] = text[:-1]
+        elif len(k) == 1 and k.isprintable():
+            self.prompt[1] = text + k
+
+    def key_list(self, k, armed):
+        n = len(self.names) + 1
+        if k in ("up", "down"):
+            self.li = (self.li + (1 if k == "down" else -1)) % n
+            self.paint(self.listed(self.li))
+        elif k in ("enter", "right") and self.li:
+            self.edit(Theme.load(self.names[self.li - 1]))
+        elif k in ("enter", "right", "n"):
+            base = self.listed(self.li)
+            self.prompt = ["new theme name", "theme-", lambda s: self.create(s.strip(), base)]
+        elif k in ("q", "esc"):
+            self.done = True
+
+    def key_tree(self, k, armed):
+        rows = self.rows()
+        kind, ref = rows[self.ti]
+        if k in ("up", "down"):
+            self.ti = (self.ti + (1 if k == "down" else -1)) % len(rows)
+        elif kind == "group" and k in ("right", "enter"):
+            if ref in self.folded:
+                self.folded.discard(ref)
+            elif k == "enter":
+                self.folded.add(ref)
+        elif kind == "group" and k == "left":
+            self.folded.add(ref)
+        elif kind == "elem" and k == "enter":
+            c = self.theme.colors
+            sources = [(key, c[key]) for key in ORDER if key != ref and c.get(key)]
+            self.pick = Picker(ref, c.get(ref) or self.fallback(ref), c.get(ref), sources)
+            self.mode = "pick"
+        elif kind == "elem" and k == "left":
+            self.focus(("group", GROUP_OF[ref]))
+        elif k in ("-", "+"):
+            self.folded = set(range(len(GROUPS))) if k == "-" else set()
+            self.focus(rows[self.ti])
+        elif kind == "elem" and k == "x":
+            self.setc(ref, None)
+        elif kind == "elem" and k == "r":
+            self.setc(ref, self.theme.saved.get(ref))
+        elif k == "s":
+            self.save()
+        elif k == "S":
+            self.prompt = ["save as", self.theme.name, self.save_as]
+        elif k == "a":
+            self.apply()
+        elif k == "esc" and self.risky(k, armed, "drop them"):
+            self.back()
+        elif k == "q" and self.risky(k, armed, "quit without saving"):
+            self.done = True
+
+    def key_pick(self, k, armed):
+        p = self.pick
+        if k in ("up", "down"):
+            p.chan = max(0, min(Picker.COPY, p.chan + (1 if k == "down" else -1)))
+        elif k in ("left", "right", "S-left", "S-right"):
+            step = 1 if k.endswith("right") else -1
+            if p.chan == Picker.COPY:
+                if not p.sources:
+                    return
+                p.copy = (p.copy + step) % len(p.sources) if p.copy >= 0 else (0 if step > 0 else -1)
+                p.set_hex(p.sources[p.copy][1])
+            else:
+                p.set(p.chan, p.value(p.chan) + step * (10 if k.startswith("S-") else 1))
+            self.setc(p.key, p.hex)
+        elif k == "#":
+            self.prompt = ["hex #", "", self.take_hex]
+        elif k == "enter":
+            self.setc(p.key, p.hex)
+            self.mode = "tree"
+        elif k == "esc":
+            self.setc(p.key, p.before)
+            self.mode = "tree"
+
+    def take_hex(self, text):
+        v = norm(text)
+        if not v:
+            self.say(f"not a hex colour: {text}", RED)
+            return
+        self.pick.set_hex(v)
+        self.setc(self.pick.key, v)
+
+    # --- layout ---------------------------------------------------------------
+
+    def draw(self):
+        tw, th = os.get_terminal_size(self.tty)
+        w, h = min(tw, MAX_W), min(th, MAX_H)
+        # The window wears the theme being edited, so its own text can
+        # vanish into a background near the foreground. Force a readable
+        # ink when the two get close.
+        t = self.theme or self.listed(self.li)
+        fgc, bgc = (t.colors.get("foreground"), t.colors.get("background")) if t else (None, None)
+        low = fgc and bgc and abs(lum(fgc) - lum(bgc)) < 60
+        c = Canvas(w, h, FG(ink(bgc)) if low else "")
+        if w < MIN_W or h < MIN_H:
+            c.put(h // 2, 2, f"make the window at least {MIN_W}×{MIN_H} · now {w}×{h}", DIM)
+            self.out(c.render())
+            return
+        lw = max(32, min(40, w * 2 // 5))
+        bh = h - 2
+        self.draw_header(c, w)
+        left = "themes" if self.mode == "list" else "elements"
+        right = "colour" if self.mode == "pick" else "preview"
+        box(c, 1, 0, lw, bh, left, self.mode != "pick")
+        box(c, 1, lw, w - lw, bh, right, self.mode == "pick")
+        inner = (2, 1, lw - 2, bh - 2)
+        pane = (2, lw + 2, w - lw - 4, bh - 2)
+        if self.mode == "list":
+            self.draw_list(c, *inner)
+            t = self.listed(self.li)
+            preview(c, *pane, t.colors if t else {})
+        else:
+            self.draw_tree(c, *inner)
+            if self.mode == "pick":
+                self.draw_pick(c, *pane)
+            else:
+                kind, ref = self.rows()[self.ti]
+                preview(c, *pane, self.theme.colors, ref if kind == "elem" else None)
+        self.draw_footer(c, w, h - 1)
+        self.out(c.centred(tw, th).render())
+
+    def draw_header(self, c, w):
+        c.put(0, 1, "ghostty-theme-edit", BOLD)
+        crumbs = ["themes"]
+        if self.theme:
+            crumbs.append(self.theme.name)
+        if self.mode == "pick":
+            crumbs.append(LABEL[self.pick.key])
+        right = f"config · {self.config or 'none'} "
+        if self.theme and self.theme.dirty:
+            right = "unsaved  " + right
+        end = w - len(right) - 2         # crumbs stop short of the right side
+        x = 21
+        for i, crumb in enumerate(crumbs):
+            last = i == len(crumbs) - 1
+            text = crumb + ("" if last else " › ")
+            c.put(0, x, text, BOLD if last else DIM, limit=end - x)
+            x += len(text)
+        if self.theme and self.theme.dirty:
+            c.put(0, w - len(right), "unsaved", YELLOW)
+            c.put(0, w - len(right) + 9, right[9:], DIM)
+        else:
+            c.put(0, w - len(right), right, DIM)
+
+    def draw_list(self, c, y, x, w, h):
+        n = len(self.names) + 1
+        self.loff = max(min(self.loff, self.li), self.li - h + 1)
+        for row in range(min(h, n - self.loff)):
+            i = self.loff + row
+            name = "+ new theme" if i == 0 else self.names[i - 1]
+            mark = "•" if i and name == self.config else " "
+            text = f"{mark} {name}".ljust(w - 10)[:w - 10]
+            c.put(y + row, x + 1, text, REV if i == self.li else (DIM if i == 0 else ""))
+            if i:
+                keys = ("background", *(f"palette:{j}" for j in range(1, 7)), "foreground")
+                strip(c, y + row, x + w - 8, self.listed(i).colors, keys)
+
+    def draw_tree(self, c, y, x, w, h):
+        rows, t = self.rows(), self.theme
+        self.toff = max(min(self.toff, self.ti), self.ti - h + 1)
+        lw = w - 13
+        for r in range(min(h, len(rows) - self.toff)):
+            i = self.toff + r
+            kind, ref = rows[i]
+            on = i == self.ti
+            if kind == "group":
+                name, items = GROUPS[ref]
+                arrow = "▸" if ref in self.folded else "▾"
+                c.put(y + r, x + 1, f"{arrow} {name}".ljust(lw), (REV if on else "") + BOLD)
+                strip(c, y + r, x + w - 8, t.colors, [k for k, _ in items])
+                continue
+            v = t.colors.get(ref)
+            changed = "•" if v != t.saved.get(ref) else " "
+            c.put(y + r, x, changed, YELLOW)
+            c.put(y + r, x + 1, f"  {LABEL[ref]}".ljust(lw)[:lw], REV if on else "")
+            c.put(y + r, x + w - 11, "  ", BG(v) if v else "")
+            c.put(y + r, x + w - 8, v or "unset", "" if v else DIM)
+        if self.toff:
+            c.put(y - 1, x + w - 2, "↑", DIM)
+        if self.toff + h < len(rows):
+            c.put(y + h, x + w - 2, "↓", DIM)
+
+    def draw_pick(self, c, y, x, w, h):
+        p = self.pick
+        c.put(y, x, LABEL[p.key], BOLD)
+        c.put(y, x + w - 7, p.hex, BOLD)
+        third = w // 3
+        for r in (1, 2):
+            if p.before:
+                c.put(y + r, x, (" was" if r == 1 else "").ljust(third), BG(p.before) + FG(ink(p.before)))
+            else:
+                c.put(y + r, x, (" unset" if r == 1 else "").ljust(third), DIM)
+            c.put(y + r, x + third, (" now" if r == 1 else "").ljust(w - third), BG(p.hex) + FG(ink(p.hex)))
+
+        tw = w - 7
+        for i, (name, top) in enumerate(Picker.CH):
+            yy = y + 4 + i + (i >= 3)
+            on = p.chan == i
+            c.put(yy, x, ("›" if on else " ") + name, BOLD if on else DIM)
+            v = p.value(i)
+            pos = round(v * (tw - 1) / top)
+            for j in range(tw):
+                cell = p.track(i, round(j * top / (tw - 1)))
+                c.put(yy, x + 3 + j, "┃" if j == pos else " ", BG(cell) + FG(ink(cell)))
+            c.put(yy, x + w - 3, f"{v:>3}", BOLD if on else DIM)
+
+        yy, on = y + 12, p.chan == Picker.COPY
+        c.put(yy, x, ("›" if on else " ") + "P", BOLD if on else DIM)
+        if p.sources:
+            cw = max(1, min(3, tw // len(p.sources)))
+            for j, (_, v) in enumerate(p.sources):
+                c.put(yy, x + 3 + j * cw, ("◆" if j == p.copy else "").center(cw), BG(v) + FG(ink(v)))
+            if p.copy >= 0:
+                c.put(yy + 1, x + 3, "from " + LABEL[p.sources[p.copy][0]], DIM)
+
+        if h - 15 >= len(MOCK):
+            preview(c, y + 15, x, w, h - 15, self.theme.colors, p.key)
+
+    def draw_footer(self, c, w, y):
+        if self.prompt:
+            label, text, _ = self.prompt
+            c.put(y, 1, f"{label} › ", BOLD)
+            c.put(y, len(label) + 4, text)
+            c.put(y, len(label) + 4 + len(text), " ", REV)
+            c.put(y, w - 22, "enter ok · esc cancel", DIM)
+            return
+        if self.msg:
+            c.put(y, 1, self.msg[0], self.msg[1], limit=w - 2)
+            return
+        if self.mode == "list":
+            hints = ["↑↓ move", "enter open", "n new from this", "q quit", "• in config"]
+        elif self.mode == "tree":
+            hints = ["↑↓←→ move", "enter edit", "s save", "S save as", "a apply",
+                     "esc back", "x unset", "r revert", "-/+ fold all"]
+        elif self.pick.chan == Picker.COPY:
+            hints = ["←→ take a colour from this theme", "enter done", "esc undo"]
+        else:
+            hints = ["↑↓ channel", "←→ adjust", "⇧←→ by 10", "# hex", "enter done", "esc undo"]
+        line = ""
+        for hint in hints:
+            if len(line) + len(hint) + 3 > w - 2:
+                break
+            line += (" · " if line else "") + hint
+        c.put(y, 1, line, DIM)
+
+    # --- loop -----------------------------------------------------------------
+
+    def run(self):
+        old = termios.tcgetattr(self.tty)
+        self.out("\x1b[?1049h\x1b[?25l\x1b[?7l")
+        tty.setraw(self.tty)
+        try:
+            if self.mode == "list":
+                self.paint(self.listed(self.li))
+            size, stale = None, True
+            while not self.done:
+                now = os.get_terminal_size(self.tty)
+                if stale or now != size:
+                    self.draw()
+                    size, stale = now, False
+                if select.select([self.tty], [], [], 0.25)[0]:
+                    for k in keys(os.read(self.tty, 1024)):
+                        self.key(k)
+                        if self.done:
+                            break
+                    stale = True
+        finally:
+            termios.tcsetattr(self.tty, termios.TCSADRAIN, old)
+            self.out("\x1b[?7h\x1b[?25h\x1b[?1049l")
+            self.paint(self.config_base())
+            os.close(self.tty)
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return
+    if not os.isatty(sys.stdout.fileno()):
+        sys.exit("ghostty-theme-edit: needs a terminal")
+    App(args[0] if args else None).run()
+
+
+if __name__ == "__main__":
+    main()

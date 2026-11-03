@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# starship-preset — pick a Starship prompt config from a live-previewing list.
+#
+#   starship-preset              picker: Enter uses it in every shell
+#   starship-preset <name>       use <name> in every shell, no UI
+#   starship-preset -H [name]    the same, for this project only
+#   starship-preset -r [-H]      back to the default, everywhere or here
+#   starship-preset -s           say which config this directory uses
+#   starship-preset -l           list presets
+#   starship-preset --save NAME  keep the config in use here as a preset
+#   starship-preset -e [name]    open a preset in $EDITOR
+#
+# A project is the git top level, or the directory when there is none.
+# Its pick beats the everywhere pick. The list holds `default` (the
+# config), your presets, then Starship's built-in ones. The preview
+# draws each preset's real prompt for the directory you started in.
+# zsh/starship-preset.zsh reads the pick before every prompt, so open
+# shells switch on their next prompt.
+set -euo pipefail
+
+# fzf re-invokes this script for the preview, so it needs an absolute path
+# regardless of how the user typed the command.
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+DEFAULT="$HOME/.config/starship.toml"
+PRESETS="${STARSHIP_PRESETS_DIR:-$HOME/.config/starship/presets}"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/starship-preset"
+BUILTIN="$STATE/builtin"
+# Keep these two file names in step with zsh/starship-preset.zsh.
+GLOBAL="$STATE/global"        # one path
+PROJECTS="$STATE/projects"    # dir<TAB>path, one a line
+
+die() { printf 'starship-preset: %s\n' "$1" >&2; exit 1; }
+
+# --- names and paths -----------------------------------------------------
+# Built-ins are written out fresh each run, so a Starship upgrade shows up.
+# It takes a few milliseconds for all of them.
+refresh_builtin() {
+  mkdir -p "$BUILTIN"
+  local n
+  for n in $(starship preset --list); do
+    starship preset "$n" -o "$BUILTIN/$n.toml" 2>/dev/null || true
+  done
+}
+
+user_names() {
+  [ -d "$PRESETS" ] || return 0
+  find -L "$PRESETS" -maxdepth 1 -type f -name '*.toml' ! -name '.*' \
+    -exec basename {} .toml \; | sort
+}
+
+# Lines of name<TAB>source. A preset of yours hides a built-in of the
+# same name.
+listing() {
+  local mine n
+  mine=$(user_names)
+  printf 'default\tconfig\n'
+  for n in $mine; do [ "$n" = default ] || printf '%s\tyours\n' "$n"; done
+  for n in $(starship preset --list); do
+    printf '%s\n' "$mine" | grep -qx "$n" || printf '%s\tbuilt-in\n' "$n"
+  done
+}
+
+path_of() {
+  case "$1" in
+    default) printf '%s\n' "$DEFAULT" ;;
+    *) if   [ -f "$PRESETS/$1.toml" ]; then printf '%s\n' "$PRESETS/$1.toml"
+       elif [ -f "$BUILTIN/$1.toml" ]; then printf '%s\n' "$BUILTIN/$1.toml"
+       else return 1; fi ;;
+  esac
+}
+
+name_of() {
+  if [ "$1" = "$DEFAULT" ]; then printf 'default\n'; else basename "$1" .toml; fi
+}
+
+project_dir() {
+  git -C "${1:-$PWD}" rev-parse --show-toplevel 2>/dev/null || (cd "${1:-$PWD}" && pwd -P)
+}
+
+# --- which config a directory uses --------------------------------------
+# Prints path<TAB>why. The longest project match wins, then the global pick.
+# The zsh hook does the same walk without forking.
+in_use() {
+  local dir="$1" p f best='' bestdir=''
+  if [ -f "$PROJECTS" ]; then
+    while IFS=$'\t' read -r p f; do
+      case "$dir/" in
+        "$p"/*) [ ${#p} -gt ${#bestdir} ] && { bestdir=$p; best=$f; } ;;
+      esac
+    done < "$PROJECTS"
+  fi
+  if [ -n "$best" ] && [ -f "$best" ]; then printf '%s\tproject %s\n' "$best" "$bestdir"; return; fi
+  if [ -f "$GLOBAL" ]; then
+    f=$(cat "$GLOBAL")
+    [ -f "$f" ] && { printf '%s\teverywhere\n' "$f"; return; }
+  fi
+  printf '%s\tdefault\n' "$DEFAULT"
+}
+
+# --- persist -------------------------------------------------------------
+# Built-ins live in the state dir, which a later run rewrites in place, so a
+# saved path stays good.
+set_global() { mkdir -p "$STATE"; printf '%s\n' "$1" > "$GLOBAL"; }
+clear_global() { rm -f "$GLOBAL"; }
+
+set_project() { # set_project <dir> [path]; no path clears it
+  mkdir -p "$STATE"
+  local tmp; tmp=$(mktemp)
+  [ -f "$PROJECTS" ] && awk -F'\t' -v d="$1" '$1 != d' "$PROJECTS" > "$tmp"
+  [ -n "${2:-}" ] && printf '%s\t%s\n' "$1" "$2" >> "$tmp"
+  mv "$tmp" "$PROJECTS"
+}
+
+apply() { # apply <name>
+  local path; path=$(path_of "$1") || die "unknown preset '$1' (try -l)"
+  if [ "$HERE" = 1 ]; then
+    set_project "$(project_dir)" "$path"
+    printf '%s · project %s\n' "$1" "$(project_dir)"
+  else
+    if [ "$1" = default ]; then clear_global; else set_global "$path"; fi
+    printf '%s · everywhere\n' "$1"
+  fi
+}
+
+# --- preview pane --------------------------------------------------------
+# `starship prompt` wraps its escapes in %{ %} when it knows the shell is
+# zsh. The pane wants plain ANSI, so the shell is unset. The directory
+# module reads $PWD, so the render runs from the directory it draws.
+render() { # render <path> <dir> [prompt args…]
+  local path="$1" dir="$2"; shift 2
+  (cd "$dir" 2>/dev/null && env -u STARSHIP_SHELL STARSHIP_CONFIG="$path" PWD="$dir" \
+    starship prompt -p "$dir" -w "$COLS" "$@" 2>/dev/null) || true
+}
+
+# The modules the top-level format strings name, in order, deduped. Module
+# tables come after them, and their own format keys are not wanted.
+modules() {
+  awk '
+    on { s = s $0 "\n"; if (index($0, "\"\"\"")) on = 0; next }
+    /^[[:space:]]*\[/ { exit }
+    /^[[:space:]]*(right_)?format[[:space:]]*=/ {
+      v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); s = s v "\n"
+      if (substr(v, 1, 3) == "\"\"\"" && !index(substr(v, 4), "\"\"\"")) on = 1
+    }
+    END { print s }' "$1" |
+    grep -oE '\$[a-z_]+' | sed 's/^\$//' |
+    awk '$0 != "all" && !seen[$0]++' | tr '\n' ' '
+}
+
+preview() {
+  local name="$1" path dir right
+  path=$(path_of "$name") || { printf '\n  (missing preset file)\n'; return; }
+  dir="${STARSHIP_PRESET_HERE:-$PWD}"
+  COLS="${FZF_PREVIEW_COLUMNS:-60}"
+
+  printf '\033[1m%s\033[0m' "$name"
+  [ "$path" = "$(in_use "$dir" | cut -f1)" ] && printf '  \033[2m· in use here\033[0m'
+  case "$path" in
+    "$BUILTIN"/*) printf '\n\033[2mbuilt in to Starship\033[0m\n' ;;
+    *) printf '\n\033[2m%s\033[0m\n' "${path/#$HOME/~}" ;;
+  esac
+
+  printf '\n\033[2m── here ──\033[0m'
+  render "$path" "$dir"
+  right=$(render "$path" "$dir" --right)
+  [ -n "$right" ] && printf '\n\033[2mright:\033[0m %s' "$right"
+  printf '\n\n\033[2m── after a failed 4s command ──\033[0m'
+  render "$path" "$dir" -s 1 -d 4000
+  printf '\n\n\033[2m── home ──\033[0m'
+  render "$path" "$HOME"
+  printf '\n\n\033[2m── shows ──\033[0m\n'
+  if grep -qE '^[[:space:]]*format[[:space:]]*=' "$path"; then
+    modules "$path" | fold -s -w "$COLS"
+  else
+    printf 'every module, in the default order'
+  fi
+  printf '\n'
+}
+
+# --- entry points --------------------------------------------------------
+HERE=0
+case "${1:-}" in
+  -H|--here) HERE=1; shift ;;
+esac
+
+case "${1:-}" in
+  --preview) preview "$2"; exit 0 ;;
+  -l|--list) refresh_builtin; listing | column -t -s $'\t'; exit 0 ;;
+  -s|--status)
+    IFS=$'\t' read -r p why <<< "$(in_use "$PWD")"
+    printf '%s · %s\n' "$(name_of "$p")" "$why"; exit 0 ;;
+  -r|--reset)
+    [ "${2:-}" = -H ] || [ "${2:-}" = --here ] && HERE=1
+    if [ "$HERE" = 1 ]; then set_project "$(project_dir)"; else clear_global; fi
+    IFS=$'\t' read -r p why <<< "$(in_use "$PWD")"
+    printf 'now %s · %s\n' "$(name_of "$p")" "$why"; exit 0 ;;
+  --save)
+    [ -n "${2:-}" ] || die "--save needs a name"
+    case "$2" in */*|default) die "bad preset name '$2'" ;; esac
+    [ -f "$PRESETS/$2.toml" ] && die "preset '$2' exists; pick another name"
+    mkdir -p "$PRESETS"
+    cp "$(in_use "$PWD" | cut -f1)" "$PRESETS/$2.toml"
+    printf 'saved %s\n' "${PRESETS/#$HOME/~}/$2.toml"; exit 0 ;;
+  -e|--edit)
+    refresh_builtin
+    name="${2:-$(name_of "$(in_use "$PWD" | cut -f1)")}"
+    path=$(path_of "$name") || die "unknown preset '$name' (try -l)"
+    case "$path" in "$BUILTIN"/*) die "'$name' is built in; --save a copy to edit it" ;; esac
+    exec ${EDITOR:-vi} "$path" ;;
+  -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -*) die "unknown option '$1' (try -h)" ;;
+esac
+
+command -v starship >/dev/null || die "starship not found (brew install starship)"
+refresh_builtin
+
+if [ -n "${1:-}" ]; then apply "$1"; exit 0; fi
+
+command -v fzf >/dev/null || die "fzf not found (brew install fzf)"
+export STARSHIP_PRESET_HERE="$PWD"
+current=$(name_of "$(in_use "$PWD" | cut -f1)")
+pos=$(listing | cut -f1 | grep -nx "$current" | cut -d: -f1 || true)
+if [ "$HERE" = 1 ]; then where="this project"; else where="every shell"; fi
+
+picked=$(listing | fzf \
+  --height=100% --layout=reverse --info=inline --pointer='>' \
+  --prompt='prompt > ' --delimiter=$'\t' --with-nth=1,2 --tabstop=24 \
+  --header="enter use in $where · esc cancel" \
+  --bind="load:pos(${pos:-1})" \
+  --preview="'$SELF' --preview {1}" --preview-window='right:60%:border-left' \
+) || exit 0
+
+apply "${picked%%$'\t'*}"

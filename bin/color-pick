@@ -1,0 +1,804 @@
+#!/usr/bin/env python3
+"""color-pick — pick a colour in the terminal, get its hex on stdout.
+
+  color-pick [options] [#rrggbb]
+
+  -t, --title TEXT    say what is being picked, on the top line
+  -p, --palette LIST  your own swatches, hex values split by commas or spaces
+  -f, --format FMT    hex (#ff8800, the default), bare (ff8800) or rgb (255 136 0)
+  -o, --out FILE      also write every change to FILE, for a live preview
+      --tab           pick in a new Ghostty tab, and this process waits
+      --split         the same, in a split to the right
+      --nested        the caller already holds the alternate screen
+      --colours MODE  full or 256. The default asks the terminal: full when
+                      COLORTERM is truecolor or 24bit, else 256
+
+Enter prints the colour and exits 0. Esc or q prints nothing and exits 1.
+A usage error exits 2.
+The picker draws on /dev/tty, so `hex=$(color-pick)` works, and so does a
+call from inside another TUI. A caller in the alternate screen passes
+--nested, then redraws once the call returns.
+
+Three parts, and tab moves between them: a grid of hues by lightness,
+H S L and R G B sliders, and a row of swatches made of --palette and your
+recent picks. Arrows move and pick at once. # types a hex value. A paste
+of a hex value takes it from anywhere. c copies the hex, r goes back to
+the colour you started with.
+
+In 256 mode each colour is drawn as its nearest xterm-256 colour, so shades
+are close, not exact. The hex you pick is still exact, and the top swatch
+shows the colour it is drawn as.
+"""
+
+import colorsys
+import os
+import re
+import select
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+import tty
+
+HOME = os.path.expanduser("~")
+STATE = os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local", "state"))
+RECENT = os.path.join(STATE, "color-pick", "recent")
+KEEP = 16
+
+BOLD, DIM, REV, RED = "\x1b[1m", "\x1b[2m", "\x1b[7m", "\x1b[31m"
+MAX_W, MIN_W, MIN_H = 72, 44, 20
+GRID_ROWS = 6
+
+
+# --- colour ----------------------------------------------------------------
+
+def rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def hexof(r, g, b):
+    return "#%02x%02x%02x" % (r, g, b)
+
+
+def hsl_hex(h, s, l):
+    r, g, b = colorsys.hls_to_rgb(h / 360, l / 100, s / 100)
+    return hexof(round(r * 255), round(g * 255), round(b * 255))
+
+
+FULL = True                         # set in main: can this terminal draw 24-bit colour
+
+
+def full_colour():
+    """True when the terminal says it draws 24-bit colour."""
+    return os.environ.get("COLORTERM", "").lower() in ("truecolor", "24bit")
+
+
+CUBE = (0, 95, 135, 175, 215, 255)        # the xterm-256 colour cube levels
+
+
+def oklab(h):
+    """h in OKLab, the space where equal steps look equal."""
+    def lin(v):
+        v /= 255
+        return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+    r, g, b = (lin(v) for v in rgb(h))
+    l = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b) ** (1 / 3)
+    m = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b) ** (1 / 3)
+    s = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b) ** (1 / 3)
+    return (0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+            1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+            0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s)
+
+
+SNAPPED = {}
+LAB256 = []                         # each xterm colour from 16 up in OKLab, filled on first use
+
+
+def xterm(h):
+    """The xterm-256 index nearest h, by eye. A colour never snaps to a grey,
+    so a dark navy stays blue rather than turning charcoal."""
+    if h not in SNAPPED:
+        L, a, b = oklab(h)
+        grey = (a * a + b * b) ** 0.5 < 0.02
+        if not LAB256:
+            LAB256.extend(oklab(xterm_hex(n)) for n in range(16, 256))
+        pool = range(240 if grey else 216)
+        SNAPPED[h] = 16 + min(pool, key=lambda i: (LAB256[i][0] - L) ** 2 +
+                              (LAB256[i][1] - a) ** 2 + (LAB256[i][2] - b) ** 2)
+    return SNAPPED[h]
+
+
+def xterm_hex(n):
+    """The colour xterm-256 index n draws, for n from 16 up."""
+    if n >= 232:
+        return hexof(*(8 + 10 * (n - 232),) * 3)
+    n -= 16
+    return hexof(CUBE[n // 36], CUBE[n // 6 % 6], CUBE[n % 6])
+
+
+def FG(h):
+    if FULL:
+        return "\x1b[38;2;%d;%d;%dm" % rgb(h)
+    return "\x1b[38;5;%dm" % xterm(h)
+
+
+def BG(h):
+    if FULL:
+        return "\x1b[48;2;%d;%d;%dm" % rgb(h)
+    return "\x1b[48;5;%dm" % xterm(h)
+
+
+def shown(h):
+    """The colour the terminal really draws for h."""
+    return h if FULL else xterm_hex(xterm(h))
+
+
+def ink(h):
+    """Black or white, whichever reads on h as drawn."""
+    r, g, b = rgb(shown(h))
+    return "#000000" if 0.299 * r + 0.587 * g + 0.114 * b > 140 else "#ffffff"
+
+
+def norm(v):
+    """#rrggbb from #rgb, rrggbb, 0xrrggbb and the like, or None."""
+    v = v.strip().strip("\"'").lower()
+    v = v[2:] if v.startswith("0x") else v.lstrip("#")
+    if re.fullmatch(r"[0-9a-f]{3}", v):
+        v = "".join(ch * 2 for ch in v)
+    return "#" + v if re.fullmatch(r"[0-9a-f]{6}", v) else None
+
+
+def find_hex(text):
+    """The first hex colour anywhere in text, as from a paste."""
+    m = re.search(r"#?\b([0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b", text)
+    return norm(m.group(1)) if m else None
+
+
+def fmt(h, how):
+    if how == "bare":
+        return h[1:]
+    if how == "rgb":
+        return "%d %d %d" % rgb(h)
+    return h
+
+
+# --- state on disk ----------------------------------------------------------
+
+def write_atomic(path, text):
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".color-pick.")
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def recent():
+    try:
+        with open(RECENT) as f:
+            return [v for v in (norm(line) for line in f) if v]
+    except OSError:
+        return []
+
+
+def remember(h):
+    try:
+        write_atomic(RECENT, "\n".join([h] + [v for v in recent() if v != h][:KEEP - 1]) + "\n")
+    except OSError:
+        pass
+
+
+def copy_text(text):
+    """Into the clipboard: a native tool when there is one, else OSC 52."""
+    for cmd in (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"]):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, input=text.encode(), check=True, timeout=2)
+                return ""
+            except (OSError, subprocess.SubprocessError):
+                pass
+    import base64
+    return "\x1b]52;c;%s\a" % base64.b64encode(text.encode()).decode()
+
+
+# --- colour model -------------------------------------------------------------
+
+class Colour:
+    CH = (("H", 359), ("S", 100), ("L", 100), ("R", 255), ("G", 255), ("B", 255))
+
+    def __init__(self, start):
+        self.h = self.s = self.l = 0
+        self.set_hex(start)
+
+    def set_hex(self, val):
+        self.rgb = list(rgb(val))
+        h, l, s = colorsys.rgb_to_hls(*(c / 255 for c in self.rgb))
+        self.l = round(l * 100)
+        # Grey has no hue and black or white no saturation. Keep the old
+        # ones there, so a slider pulled through zero comes back intact.
+        if 0 < self.l < 100:
+            self.s = round(s * 100)
+            if s > 0:
+                self.h = round(h * 360) % 360
+
+    @property
+    def hex(self):
+        return hexof(*self.rgb)
+
+    def value(self, c):
+        return (self.h, self.s, self.l, *self.rgb)[c]
+
+    def with_value(self, c, v):
+        if c < 3:
+            hsl = [self.h, self.s, self.l]
+            hsl[c] = v
+            return hsl_hex(*hsl)
+        parts = list(self.rgb)
+        parts[c - 3] = v
+        return hexof(*parts)
+
+    def track(self, c, v):
+        """The colour a slider cell shows. Hue and saturation tracks lift a
+        grey toward full colour, so the choice ahead stays visible."""
+        if c == 0:
+            return hsl_hex(v, max(self.s, 50), max(30, min(70, self.l)))
+        if c == 1:
+            return hsl_hex(self.h, v, max(20, min(80, self.l)))
+        return self.with_value(c, v)
+
+    def set(self, c, v):
+        v = v % 360 if c == 0 else max(0, min(self.CH[c][1], v))
+        if c < 3:
+            hsl = [self.h, self.s, self.l]
+            hsl[c] = v
+            self.h, self.s, self.l = hsl
+            self.rgb = list(rgb(hsl_hex(*hsl)))
+        else:
+            self.rgb[c - 3] = v
+            self.set_hex(self.hex)
+
+
+class Grid:
+    """Hue across and lightness down, with a grey column at the end."""
+
+    def __init__(self, cols, rows):
+        self.cols, self.rows = cols, rows
+
+    def light(self, r, grey):
+        top, bottom = (95, 8) if grey else (82, 22)
+        return top - (top - bottom) * r / max(1, self.rows - 1)
+
+    def cell(self, r, c):
+        if c == self.cols - 1:
+            return hsl_hex(0, 0, self.light(r, True))
+        return hsl_hex(360 * c / (self.cols - 1), 90, self.light(r, False))
+
+    def nearest(self, col):
+        grey = col.s < 15
+        c = self.cols - 1 if grey else round(col.h * (self.cols - 1) / 360) % (self.cols - 1)
+        r = min(range(self.rows), key=lambda i: abs(self.light(i, grey) - col.l))
+        return r, c
+
+
+# --- drawing --------------------------------------------------------------------
+
+class Canvas:
+    """A grid of (char, style) cells, flushed in one write so nothing tears."""
+
+    def __init__(self, w, h):
+        self.w, self.h = w, h
+        self.cells = [[(" ", "")] * w for _ in range(h)]
+
+    def put(self, y, x, text, style="", limit=None):
+        if not 0 <= y < self.h:
+            return
+        if limit is not None:
+            text = text[:max(0, limit)]
+        row = self.cells[y]
+        for i, ch in enumerate(text):
+            if 0 <= x + i < self.w:
+                row[x + i] = (ch, style)
+
+    def centred(self, w, h):
+        """This canvas in the middle of a w×h one."""
+        big = Canvas(w, h)
+        oy, ox = (h - self.h) // 2, (w - self.w) // 2
+        for y, row in enumerate(self.cells):
+            big.cells[oy + y][ox:ox + self.w] = row
+        return big
+
+    def render(self):
+        out = ["\x1b[H"]
+        for y, row in enumerate(self.cells):
+            style = None
+            for ch, st in row:
+                if st != style:
+                    out.append("\x1b[0m" + st)
+                    style = st
+                out.append(ch)
+            out.append("\x1b[0m")
+            if y < self.h - 1:
+                out.append("\r\n")
+        return "".join(out)
+
+
+def box(c, y, x, w, h):
+    c.put(y, x, "╭" + "─" * (w - 2) + "╮", DIM)
+    for r in range(y + 1, y + h - 1):
+        c.put(r, x, "│", DIM)
+        c.put(r, x + w - 1, "│", DIM)
+    c.put(y + h - 1, x, "╰" + "─" * (w - 2) + "╯", DIM)
+
+
+# --- keys -----------------------------------------------------------------------
+
+SEQ = {"[A": "up", "[B": "down", "[C": "right", "[D": "left",
+       "OA": "up", "OB": "down", "OC": "right", "OD": "left",
+       "[1;2C": "S-right", "[1;2D": "S-left", "[1;2A": "up", "[1;2B": "down",
+       "[Z": "S-tab"}
+PLAIN = {"\r": "enter", "\n": "enter", "\t": "tab", "\x7f": "bs", "\x08": "bs",
+         "\x03": "ctrl-c"}
+CSI = re.compile(r"\x1b(\[[0-9;]*[A-Za-z~]|O[A-Za-z])")
+PASTE_ON, PASTE_OFF = "\x1b[200~", "\x1b[201~"
+
+
+def keys(data):
+    s, i = data.decode("utf-8", "ignore"), 0
+    while i < len(s):
+        if s.startswith(PASTE_ON, i):
+            end = s.find(PASTE_OFF, i)
+            end = len(s) if end < 0 else end
+            yield "paste:" + s[i + len(PASTE_ON):end]
+            i = end + len(PASTE_OFF)
+            continue
+        m = CSI.match(s, i)
+        if m:
+            yield SEQ.get(m.group(1), "")
+            i = m.end()
+            continue
+        yield "esc" if s[i] == "\x1b" else PLAIN.get(s[i], s[i])
+        i += 1
+
+
+# --- app ------------------------------------------------------------------------
+
+GRID, SLIDERS, SWATCHES = range(3)
+PARTS = ("grid", "sliders", "swatches")
+
+
+class App:
+    def __init__(self, start, title, palette, out_file, nested):
+        self.tty = os.open("/dev/tty", os.O_RDWR)
+        self.start = start
+        self.col = Colour(start)
+        self.title, self.out_file, self.nested = title, out_file, nested
+        self.swatches = list(dict.fromkeys(palette + recent()))
+        self.n_given = len(set(palette))
+        self.part = GRID
+        self.chan = 0
+        self.grid = Grid(2, GRID_ROWS)
+        self.gr = self.gc = None        # the grid cursor, set on first use
+        self.si = -1
+        self.prompt = self.msg = None
+        self.result = None
+        self.done = False
+
+    def out(self, s):
+        os.write(self.tty, s.encode())
+
+    def say(self, text, style=""):
+        self.msg = (text, style)
+
+    def changed(self):
+        if self.out_file:
+            try:
+                write_atomic(self.out_file, self.col.hex + "\n")
+            except OSError as e:
+                self.say(f"cannot write {self.out_file}: {e.strerror}", RED)
+
+    def take(self, h):
+        self.col.set_hex(h)
+        self.changed()
+
+    # --- key handling ---------------------------------------------------------
+
+    def key(self, k):
+        if k == "ctrl-c":
+            self.done = True
+            return
+        if k.startswith("paste:"):
+            v = find_hex(k[6:])
+            if v:
+                self.prompt = None
+                self.take(v)
+                self.say(f"pasted {v}")
+            else:
+                self.say("no hex colour in that paste", RED)
+            return
+        if self.prompt is not None:
+            self.prompt_key(k)
+            return
+        self.msg = None
+        k = {"h": "left", "j": "down", "k": "up", "l": "right",
+             "H": "S-left", "L": "S-right"}.get(k, k)
+        if k == "enter":
+            self.result = self.col.hex
+            self.done = True
+        elif k in ("esc", "q"):
+            self.done = True
+        elif k == "tab":
+            self.enter_part((self.part + 1) % 3)
+        elif k == "S-tab":
+            self.enter_part((self.part - 1) % 3)
+        elif k == "#":
+            self.prompt = ""
+        elif k == "c":
+            self.out(copy_text(self.col.hex))
+            self.say(f"copied {self.col.hex}")
+        elif k == "r":
+            self.take(self.start)
+            self.say(f"back to {self.start}")
+        else:
+            (self.key_grid, self.key_sliders, self.key_swatches)[self.part](k)
+
+    def prompt_key(self, k):
+        if k == "esc":
+            self.prompt = None
+        elif k == "enter":
+            v = norm(self.prompt)
+            if v:
+                self.prompt = None
+                self.take(v)
+            else:
+                self.say(f"not a hex colour: {self.prompt}", RED)
+        elif k == "bs":
+            self.prompt = self.prompt[:-1]
+        elif len(k) == 1 and k.isprintable() and len(self.prompt) < 8:
+            self.prompt += k
+
+    def enter_part(self, part, from_below=False):
+        self.part = part
+        if part == GRID:
+            self.gr, self.gc = self.grid.nearest(self.col)
+        elif part == SLIDERS:
+            self.chan = len(Colour.CH) - 1 if from_below else 0
+        elif part == SWATCHES and self.swatches:
+            self.si = self.swatches.index(self.col.hex) if self.col.hex in self.swatches else -1
+
+    def key_grid(self, k):
+        g = self.grid
+        if self.gr is None:
+            self.gr, self.gc = g.nearest(self.col)
+        if k == "down" and self.gr == g.rows - 1:
+            self.enter_part(SLIDERS)
+            return
+        if k == "up" and self.gr == 0:
+            self.enter_part(SWATCHES)
+            return
+        dr = {"up": -1, "down": 1}.get(k, 0)
+        dc = {"left": -1, "right": 1, "S-left": -4, "S-right": 4}.get(k, 0)
+        if not (dr or dc):
+            return
+        self.gr = max(0, min(g.rows - 1, self.gr + dr))
+        self.gc = (self.gc + dc) % g.cols
+        self.take(g.cell(self.gr, self.gc))
+
+    def key_sliders(self, k):
+        if k == "up":
+            if self.chan == 0:
+                self.enter_part(GRID)
+                self.gr = self.grid.rows - 1
+            else:
+                self.chan -= 1
+        elif k == "down":
+            if self.chan == len(Colour.CH) - 1:
+                self.enter_part(SWATCHES)
+            else:
+                self.chan += 1
+        elif k in ("left", "right", "S-left", "S-right"):
+            step = (1 if k.endswith("right") else -1) * (10 if k.startswith("S-") else 1)
+            self.col.set(self.chan, self.col.value(self.chan) + step)
+            self.changed()
+
+    def key_swatches(self, k):
+        if k == "up":
+            self.enter_part(SLIDERS, from_below=True)
+        elif k == "down":
+            self.enter_part(GRID)
+            self.gr = 0
+        elif k in ("left", "right", "S-left", "S-right") and self.swatches:
+            step = 1 if k.endswith("right") else -1
+            if self.si < 0:
+                self.si = 0 if step > 0 else len(self.swatches) - 1
+            else:
+                self.si = (self.si + step) % len(self.swatches)
+            self.take(self.swatches[self.si])
+
+    # --- layout ---------------------------------------------------------------
+
+    def draw(self):
+        tw, th = os.get_terminal_size(self.tty)
+        w, h = min(tw, MAX_W), th
+        if w < MIN_W or h < MIN_H:
+            c = Canvas(tw, th)
+            c.put(th // 2, 1, f"need {MIN_W}×{MIN_H} · now {tw}×{th}", DIM)
+            self.out(c.render())
+            return
+        # Every row below the grid is fixed, so the grid gives up rows first.
+        rows = max(2, min(GRID_ROWS, h - 18))
+        x, iw = 3, w - 6
+        tr = iw - 5                                  # slider track width
+        cols = max(4, tr // 2)
+        if (self.grid.cols, self.grid.rows) != (cols, rows):
+            self.grid = Grid(cols, rows)
+            if self.gr is not None:
+                self.gr, self.gc = self.grid.nearest(self.col)
+        bh = rows + 16
+        c = Canvas(w, min(h, bh + 2))
+        self.draw_header(c, w)
+        box(c, 1, 0, w, bh)
+        y = self.draw_swatch(c, 2, x, iw)
+        y = self.draw_grid(c, y + 1, x, iw, tr)
+        y = self.draw_sliders(c, y + 1, x, iw, tr)
+        self.draw_swatches(c, y + 1, x, iw, tr)
+        self.draw_footer(c, w, bh + 1)
+        self.out(c.centred(tw, th).render())
+
+    def draw_header(self, c, w):
+        c.put(0, 1, "color-pick", BOLD)
+        if self.title:
+            c.put(0, 11, " · " + self.title, "", limit=w - 22)
+        c.put(0, w - 8, self.col.hex, BOLD)
+
+    def draw_swatch(self, c, y, x, w):
+        was, now = self.start, self.col.hex
+        third = w // 3
+        # In 256 mode the second row says what the terminal really draws.
+        under = "" if shown(now) == now else " drawn as " + shown(now)
+        for r in (0, 1):
+            c.put(y + r, x, (" was " + was if r == 0 else "").ljust(third), BG(was) + FG(ink(was)))
+            c.put(y + r, x + third, (" now " + now if r == 0 else under).ljust(w - third),
+                  BG(now) + FG(ink(now)))
+        return y + 2
+
+    def label(self, c, y, x, text, part):
+        on = self.part == part and self.prompt is None
+        c.put(y, x, ("› " if on else "  ") + text, BOLD if on else DIM)
+
+    def draw_grid(self, c, y, x, w, tr):
+        g, on = self.grid, self.part == GRID
+        for r in range(g.rows):
+            if r == 0:
+                self.label(c, y, x - 2, "", GRID)
+            for j in range(g.cols):
+                v = g.cell(r, j)
+                mark = "◆ " if on and (r, j) == (self.gr, self.gc) else "  "
+                c.put(y + r, x + 2 + j * 2, mark, BG(v) + FG(ink(v)))
+        return y + g.rows
+
+    def draw_sliders(self, c, y, x, w, tr):
+        col, on = self.col, self.part == SLIDERS
+        for i, (name, top) in enumerate(Colour.CH):
+            yy = y + i + (i >= 3)
+            here = on and self.chan == i
+            c.put(yy, x - 2, ("› " if here else "  ") + name, BOLD if here else DIM)
+            v = col.value(i)
+            pos = round(v * (tr - 1) / top)
+            for j in range(tr):
+                cell = col.track(i, round(j * top / (tr - 1)))
+                c.put(yy, x + 2 + j, "┃" if j == pos else " ", BG(cell) + FG(ink(cell)))
+            c.put(yy, x + w - 3 + 1, f"{v:>3}", BOLD if here else DIM, limit=3)
+        return y + 7
+
+    def draw_swatches(self, c, y, x, w, tr):
+        on = self.part == SWATCHES
+        c.put(y, x - 2, ("› " if on else "  ") + "P", BOLD if on else DIM)
+        if not self.swatches:
+            c.put(y, x + 2, "your recent picks show here", DIM)
+            return
+        cw = max(1, min(3, (tr - 1) // len(self.swatches)))
+        cx = x + 2
+        for j, v in enumerate(self.swatches):
+            if j == self.n_given and j:
+                cx += 1                              # a gap before the recents
+            mark = "◆" if on and j == self.si else ""
+            c.put(y, cx, mark.center(cw), BG(v) + FG(ink(v)), limit=x + 2 + tr - cx)
+            cx += cw
+        if self.n_given:
+            c.put(y + 1, x + 2, "yours", DIM)
+            if self.n_given < len(self.swatches):
+                c.put(y + 1, x + 2 + self.n_given * cw + 1, "recent", DIM)
+        else:
+            c.put(y + 1, x + 2, "recent", DIM)
+
+    def draw_footer(self, c, w, y):
+        if self.prompt is not None:
+            c.put(y, 1, "hex # ", BOLD)
+            c.put(y, 7, self.prompt)
+            c.put(y, 7 + len(self.prompt), " ", REV)
+            c.put(y, w - 22, "enter ok · esc cancel", DIM)
+            return
+        if self.msg:
+            c.put(y, 1, self.msg[0], self.msg[1], limit=w - 2)
+            return
+        hints = ["enter done", "esc cancel", "tab " + PARTS[(self.part + 1) % 3],
+                 "# hex", "c copy", "r reset", "⇧ ×10"]
+        line = ""
+        for hint in hints:
+            if len(line) + len(hint) + 3 > w - 2:
+                break
+            line += (" · " if line else "") + hint
+        c.put(y, 1, line, DIM)
+
+    # --- loop -----------------------------------------------------------------
+
+    def run(self):
+        old = termios.tcgetattr(self.tty)
+        self.out(("\x1b[2J" if self.nested else "\x1b[?1049h") + "\x1b[?25l\x1b[?7l\x1b[?2004h")
+        tty.setraw(self.tty)
+        try:
+            size, stale = None, True
+            while not self.done:
+                now = os.get_terminal_size(self.tty)
+                if stale or now != size:
+                    self.draw()
+                    size, stale = now, False
+                if select.select([self.tty], [], [], 0.25)[0]:
+                    for k in keys(os.read(self.tty, 4096)):
+                        self.key(k)
+                        if self.done:
+                            break
+                    stale = True
+        finally:
+            termios.tcsetattr(self.tty, termios.TCSADRAIN, old)
+            self.out("\x1b[?2004l\x1b[?7h\x1b[?25h" + ("\x1b[0m\x1b[2J\x1b[H" if self.nested else "\x1b[?1049l"))
+            os.close(self.tty)
+        if self.result:
+            remember(self.result)
+        elif self.out_file:
+            self.take(self.start)           # a cancel puts the live preview back
+        return self.result
+
+
+# --- another tab ------------------------------------------------------------------
+
+APPLESCRIPT = """
+on run argv
+  tell application "Ghostty"
+    set cfg to new surface configuration
+    set command of cfg to item 2 of argv
+    set wait after command of cfg to false
+    if item 1 of argv is "split" then
+      split (focused terminal of selected tab of front window) direction right with configuration cfg
+    else
+      new tab in front window with configuration cfg
+    end if
+  end tell
+end run
+"""
+
+
+def elsewhere(where, args):
+    """Run the picker in a Ghostty tab or split and wait for its answer."""
+    if sys.platform != "darwin" or not shutil.which("osascript"):
+        die("color-pick: --tab and --split need Ghostty on macOS")
+    d = tempfile.mkdtemp(prefix="color-pick.")
+    answer = os.path.join(d, "answer")
+    me = os.path.realpath(__file__)
+    cmd = " ".join(shlex.quote(a) for a in [sys.executable, me, "--answer", answer] + args)
+    r = subprocess.run(["osascript", "-e", APPLESCRIPT, where, cmd],
+                       capture_output=True, text=True)
+    if r.returncode:
+        shutil.rmtree(d, ignore_errors=True)
+        die("color-pick: could not open a Ghostty %s: %s" % (where, r.stderr.strip()))
+    try:
+        # The tab marks itself started. Without that mark soon, it failed
+        # before it could ever answer.
+        t0 = time.time()
+        while not os.path.exists(answer):
+            if not os.path.exists(answer + ".started") and time.time() - t0 > 10:
+                die("color-pick: the picker %s never started" % where)
+            time.sleep(0.1)
+        with open(answer) as f:
+            return f.read().strip() or None
+    except KeyboardInterrupt:
+        return None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# --- main ---------------------------------------------------------------------------
+
+def die(msg):
+    """Usage and setup errors exit 2, apart from a cancel's 1."""
+    print(msg, file=sys.stderr)
+    sys.exit(2)
+
+
+def parse(argv):
+    opts = {"title": None, "palette": [], "format": "hex", "out": None,
+            "where": None, "nested": False, "answer": None, "start": None,
+            "colours": "auto"}
+    rest, i = [], 0
+    takes = {"-t": "title", "--title": "title", "-p": "palette", "--palette": "palette",
+             "-f": "format", "--format": "format", "-o": "out", "--out": "out",
+             "--answer": "answer", "--colours": "colours", "--colors": "colours"}
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            print(__doc__.strip())
+            sys.exit(0)
+        if "=" in a and a.split("=", 1)[0] in takes:
+            a, val = a.split("=", 1)
+            argv = argv[:i] + [a, val] + argv[i + 1:]
+        if a in takes:
+            if i + 1 >= len(argv):
+                die(f"color-pick: {a} needs a value")
+            key, val = takes[a], argv[i + 1]
+            if key == "palette":
+                bad = [p for p in re.split(r"[\s,]+", val) if p and not norm(p)]
+                if bad:
+                    die(f"color-pick: not a hex colour: {bad[0]}")
+                opts[key] += [norm(p) for p in re.split(r"[\s,]+", val) if p]
+            else:
+                opts[key] = val
+            if key != "answer":
+                rest += [a, val]
+            i += 2
+            continue
+        if a in ("--tab", "--split"):
+            opts["where"] = a[2:]
+        elif a == "--nested":
+            opts["nested"] = True
+            rest.append(a)
+        elif a.startswith("-") and not norm(a):
+            die(f"color-pick: unknown option {a} · try --help")
+        elif norm(a):
+            opts["start"] = norm(a)
+            rest.append(opts["start"])
+        else:
+            die(f"color-pick: not a hex colour: {a}")
+        i += 1
+    if opts["format"] not in ("hex", "bare", "rgb"):
+        die("color-pick: --format is hex, bare or rgb")
+    if opts["colours"] not in ("auto", "full", "256"):
+        die("color-pick: --colours is full or 256")
+    return opts, rest
+
+
+def main():
+    global FULL
+    opts, rest = parse(sys.argv[1:])
+    FULL = opts["colours"] == "full" or (opts["colours"] == "auto" and full_colour())
+    if opts["where"]:
+        # The other tab owns the screen, so --nested means nothing there.
+        result = elsewhere(opts["where"], [a for a in rest if a != "--nested"])
+    else:
+        try:
+            open("/dev/tty").close()
+        except OSError:
+            die("color-pick: needs a terminal")
+        # Closing the tab sends SIGHUP. Turn it into a normal exit, so the
+        # waiting side still hears back.
+        signal.signal(signal.SIGHUP, lambda *_: sys.exit(1))
+        result = None
+        if opts["answer"]:
+            write_atomic(opts["answer"] + ".started", "")
+        try:
+            result = App(opts["start"] or "#808080", opts["title"], opts["palette"],
+                         opts["out"], opts["nested"]).run()
+        finally:
+            if opts["answer"]:
+                write_atomic(opts["answer"], (result or "") + "\n")
+    if not result:
+        sys.exit(1)
+    print(fmt(result, opts["format"]))
+
+
+if __name__ == "__main__":
+    main()

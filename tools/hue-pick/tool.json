@@ -1,0 +1,12 @@
+{
+  "name": "hue-pick",
+  "about": "a family of shades per hue, for categories that must stay apart",
+  "template": "picker contract",
+  "entries": [
+    "bin/hue-pick"
+  ],
+  "links": {},
+  "needs": [
+    "python3"
+  ]
+}

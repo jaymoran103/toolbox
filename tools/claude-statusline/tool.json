@@ -1,0 +1,15 @@
+{
+  "name": "claude-statusline",
+  "about": "which stats Claude Code's status line shows",
+  "template": "preset-kit",
+  "entries": [
+    "bin/claude-statusline"
+  ],
+  "links": {
+    "presets/claude-statusline": "~/.config/claude-statusline/presets"
+  },
+  "needs": [
+    "python3",
+    "git"
+  ]
+}

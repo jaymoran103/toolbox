@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""claude-statusline — Claude Code's status line, drawn from a preset.
+
+Claude Code pipes session JSON in and shows the one line this prints.
+Run it by hand in a terminal and it opens the picker instead: choose
+which stats show and in what order, keep presets, and pick one. Running
+sessions take a pick on their next refresh, and new sessions start with it.
+
+Each run keeps its input in ~/.local/state/claude-statusline/sample.json,
+so the picker draws your real numbers from the last session.
+
+Every file in ~/.config/claude-statusline/hooks/ also gets each input on
+stdin, with its output discarded, such as a metrics exporter. A .py file
+runs through python3.
+
+The `default` preset prints exactly what the old shell version did.
+"""
+
+import json
+import math
+import os
+import subprocess
+import sys
+import textwrap
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+from preset_kit import DIM, Element, Tool, main  # noqa: E402
+
+HOME = os.path.expanduser("~")
+HOOKS = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"),
+                     "claude-statusline", "hooks")
+
+# Made-up numbers for the picker before any session has run.
+FIXTURE = {
+    "cwd": os.path.join(HOME, "dotfiles"),
+    "workspace": {"current_dir": os.path.join(HOME, "dotfiles")},
+    "model": {"display_name": "Opus"},
+    "version": "2.1.0",
+    "output_style": {"name": "default"},
+    "context_window": {"used_percentage": 34.2},
+    "rate_limits": {"seven_day": {"used_percentage": 41.5}, "five_hour": {"used_percentage": 12.0}},
+    "cost": {"total_cost_usd": 1.237, "total_duration_ms": 2_460_000,
+             "total_lines_added": 182, "total_lines_removed": 37},
+    "prompt_cache": {"warm": True, "hit_ratio": 0.91, "misses": 2, "requests": 23,
+                     "expires_at": time.time() + 240},
+}
+
+
+# --- reading the input ------------------------------------------------------
+
+def get(d, *path):
+    for p in path:
+        d = d.get(p) if isinstance(d, dict) else None
+    return d
+
+
+def num(v):
+    """A number the way jq prints one: 2 not 2.0."""
+    return str(int(v)) if float(v).is_integer() else repr(float(v))
+
+
+def run_git(d, *args):
+    if not d:
+        return ""
+    try:
+        r = subprocess.run(["git", "-C", d, *args], capture_output=True, text=True)
+    except OSError:
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+class Session:
+    """One input, with the git facts read once and only when a segment asks."""
+
+    def __init__(self, data):
+        self.d = data if isinstance(data, dict) else {}
+        self.dir = get(self.d, "workspace", "current_dir") or self.d.get("cwd") or ""
+        self._git = None
+
+    def git(self):
+        if self._git is None:
+            d = self.dir
+            branch = run_git(d, "branch", "--show-current")
+            dirty = "*" if run_git(d, "status", "--porcelain") else ""
+            wt = get(self.d, "workspace", "git_worktree") or get(self.d, "worktree", "name") or ""
+            # A linked worktree has its own git dir, separate from the shared
+            # common dir. Absolute paths, or a subdirectory reads as one.
+            if not wt:
+                dirs = run_git(d, "rev-parse", "--path-format=absolute",
+                               "--git-dir", "--git-common-dir").split("\n")
+                if len(dirs) == 2 and dirs[0] != dirs[1]:
+                    wt = os.path.basename(run_git(d, "rev-parse", "--show-toplevel"))
+            self._git = (branch, dirty, wt)
+        return self._git
+
+
+# --- segments -----------------------------------------------------------------
+# Each returns its text, or "" to drop out of the line.
+
+def left(w):
+    if not isinstance(w, dict) or w.get("used_percentage") is None:
+        return "-"
+    return f"{math.floor(100 - w['used_percentage'])}%"
+
+
+def seg_cost(s):
+    v = get(s.d, "cost", "total_cost_usd") or 0
+    return "$" + num(math.floor(v * 100 + 0.5) / 100)
+
+
+def seg_dir(s):
+    return "~" + s.dir[len(HOME):] if s.dir.startswith(HOME) else s.dir
+
+
+def seg_branch(s):
+    branch, dirty, _ = s.git()
+    return branch + dirty if branch else ""
+
+
+def seg_wt(s):
+    wt = s.git()[2]
+    return f"[wt:{wt}]" if wt else ""
+
+
+def seg_lines(s):
+    a, r = get(s.d, "cost", "total_lines_added"), get(s.d, "cost", "total_lines_removed")
+    return "" if a is None and r is None else f"+{num(a or 0)} -{num(r or 0)}"
+
+
+def seg_time(s):
+    ms = get(s.d, "cost", "total_duration_ms")
+    if ms is None:
+        return ""
+    m = int(ms // 60000)
+    return f"{m // 60}h{m % 60:02d}m" if m >= 60 else f"{m}m" if m else f"{int(ms // 1000)}s"
+
+
+def seg_cache(s):
+    c = s.d.get("prompt_cache")
+    if not isinstance(c, dict):
+        return ""
+    if c.get("warm"):
+        mins = ((c.get("expires_at") or 0) - time.time()) / 60
+        return (f"cache {math.floor((c.get('hit_ratio') or 0) * 100)}% hit"
+                f" | {num(c.get('misses') or 0)}/{num(c.get('requests') or 0)} miss"
+                f" | {math.floor(mins) if mins > 0 else 0}m left")
+    return f"cache cold | {math.floor((c.get('recache_tokens_if_cold') or 0) / 1000)}k to rebuild"
+
+
+SEGMENTS = {
+    "ctx": lambda s: f"ctx {math.floor(get(s.d, 'context_window', 'used_percentage') or 0)}%",
+    "7d": lambda s: "7d " + left(get(s.d, "rate_limits", "seven_day")),
+    "5h": lambda s: "5h " + left(get(s.d, "rate_limits", "five_hour")),
+    "cost": seg_cost,
+    "lines": seg_lines,
+    "time": seg_time,
+    "dir": seg_dir,
+    "branch": seg_branch,
+    "wt": seg_wt,
+    "model": lambda s: get(s.d, "model", "display_name") or "",
+    "style": lambda s: get(s.d, "output_style", "name") or "-",
+    "version": lambda s: "v" + str(s.d["version"]) if s.d.get("version") else "",
+    "cache": seg_cache,
+}
+# A segment right after one of these joins it with a space, not the separator.
+ATTACH = {"branch": {"dir"}, "wt": {"dir", "branch"}}
+# The prompt cache is its own unit, set apart by a wider gap.
+APART = {"cache"}
+
+
+def line(preset, data):
+    s = Session(data)
+    out, prev = "", None
+    for key in preset["show"]:
+        text = SEGMENTS[key](s)
+        if not text:
+            continue
+        if prev is None:
+            out = text
+        elif key in APART:
+            out += "    " + text
+        elif prev in ATTACH.get(key, ()):
+            out += " " + text
+        else:
+            out += preset["set"]["sep"] + text
+        prev = key
+    return out
+
+
+# --- the tool -------------------------------------------------------------------
+
+class StatusLine(Tool):
+    name = "claude-statusline"
+    title = "which stats Claude's status line shows"
+    elements = (
+        Element("ctx", "context used"),
+        Element("7d", "7-day usage left"),
+        Element("5h", "5-hour usage left"),
+        Element("cost", "session spend"),
+        Element("lines", "lines changed"),
+        Element("time", "session time"),
+        Element("dir", "directory"),
+        Element("branch", "git branch"),
+        Element("wt", "worktree"),
+        Element("model", "model"),
+        Element("style", "output style"),
+        Element("version", "Claude Code version"),
+        Element("cache", "prompt cache"),
+        Element("sep", "separator", kind="choice", choices=(" | ", " · ", "  ", " / ")),
+    )
+    builtins = {
+        "default": {"show": ["ctx", "7d", "5h", "cost", "dir", "branch", "wt", "style", "cache"]},
+        "lean": {"show": ["ctx", "5h", "dir", "branch"], "set": {"sep": "  "}},
+        "usage": {"show": ["ctx", "5h", "7d", "cost", "time", "lines"], "set": {"sep": " · "}},
+        "everything": {"show": ["model", "ctx", "5h", "7d", "cost", "time", "lines", "dir",
+                                "branch", "wt", "style", "version", "cache"]},
+    }
+
+    def sample(self):
+        path = os.path.join(self.state_dir, "sample.json")
+        try:
+            with open(path) as f:
+                return json.load(f), os.path.getmtime(path)
+        except (OSError, ValueError):
+            return FIXTURE, None
+
+    def value(self, key):
+        if key not in SEGMENTS:
+            return ""
+        if not hasattr(self, "_session"):
+            self._session = Session(self.sample()[0])
+        return SEGMENTS[key](self._session)
+
+    def render(self, preset, width):
+        data, when = self.sample()
+        text = line(preset, data)
+        rows = textwrap.wrap(text, width, subsequent_indent="  ", break_on_hyphens=False) or [""]
+        if when is None:
+            src = "made-up numbers · no session has run yet"
+        else:
+            m = int(time.time() - when) // 60
+            ago = "just now" if not m else f"{m}m ago" if m < 60 else f"{m // 60}h ago" if m < 1440 else f"{m // 1440}d ago"
+            src = "numbers from your last session · " + ago
+        return rows + ["", DIM + src]
+
+
+def run_hooks(raw):
+    try:
+        names = sorted(os.listdir(HOOKS))
+    except OSError:
+        return
+    for n in names:
+        p = os.path.join(HOOKS, n)
+        if n.startswith(".") or not os.path.isfile(p):
+            continue
+        try:
+            subprocess.run(["python3", p] if n.endswith(".py") else [p], input=raw, text=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def status_line(tool):
+    raw = sys.stdin.read()
+    run_hooks(raw)
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = {}
+    # Keep the input for the picker's preview.
+    try:
+        os.makedirs(tool.state_dir, exist_ok=True)
+        tmp = os.path.join(tool.state_dir, f".sample.{os.getpid()}")
+        with open(tmp, "w") as f:
+            f.write(raw)
+        os.replace(tmp, os.path.join(tool.state_dir, "sample.json"))
+    except OSError:
+        pass
+    sys.stdout.write(line(tool.active_preset(), data) + "\n")
+
+
+if __name__ == "__main__":
+    tool = StatusLine()
+    if not sys.argv[1:] and not sys.stdin.isatty():
+        status_line(tool)
+    else:
+        main(tool, sys.argv[1:])

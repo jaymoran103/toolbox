@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# ghostty-theme — pick a Ghostty theme from a live-previewing list.
+#
+#   ghostty-theme            interactive picker
+#   ghostty-theme <name>     apply <name> directly, no UI
+#   ghostty-theme -l         list theme names
+#   ghostty-theme -e [name]  edit a theme or make one (ghostty-theme-edit)
+#
+# Moving the cursor repaints the *current* terminal with the theme under it,
+# using OSC colour escapes — instant, and no accessibility permission needed.
+# Enter persists the choice to the config; Esc puts the old colours back.
+set -euo pipefail
+
+# fzf re-invokes this script for the preview and repaint hooks, so it needs an
+# absolute path regardless of how the user typed the command.
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+CONFIG="${GHOSTTY_CONFIG:-$HOME/.config/ghostty/config}"
+THEMES_DIR="${GHOSTTY_THEMES_DIR:-$HOME/.config/ghostty/themes}"
+
+die() { printf 'ghostty-theme: %s\n' "$1" >&2; exit 1; }
+
+# --- theme file parsing --------------------------------------------------
+# Each theme file is a Ghostty config fragment: `key = value` plus
+# `palette = N=#rrggbb`. Last assignment wins, matching Ghostty itself.
+field()   { sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*//p" "$1" | tail -1; }
+palette() { sed -n "s/^[[:space:]]*palette[[:space:]]*=[[:space:]]*$2=[[:space:]]*//p" "$1" | tail -1; }
+
+rgb() { local h=${1#\#}; printf '%d;%d;%d' "0x${h:0:2}" "0x${h:2:2}" "0x${h:4:2}"; }
+fg()  { [ -n "$1" ] && printf '\033[38;2;%sm' "$(rgb "$1")"; }
+bg()  { [ -n "$1" ] && printf '\033[48;2;%sm' "$(rgb "$1")"; }
+R=$'\033[0m'
+
+current_theme() { field "$CONFIG" theme; }
+
+theme_names() {
+  [ -d "$THEMES_DIR" ] || die "no themes directory at $THEMES_DIR"
+  find -L "$THEMES_DIR" -maxdepth 1 -type f ! -name '.*' -exec basename {} \; | sort
+}
+
+# --- live repaint --------------------------------------------------------
+# OSC 10/11/12/17/19 set fg/bg/cursor/selection; OSC 4;N sets palette slot N.
+# Written straight to /dev/tty so it still lands while fzf owns stdout.
+repaint() {
+  local f="$THEMES_DIR/$1"
+  [ -f "$f" ] || return 0
+  # The subshell owns the /dev/tty redirect, so when there is no controlling
+  # terminal (cron, a pipe, ssh -T) the open failure is swallowed with it.
+  (
+    {
+      local key val v i
+      for pair in "10 foreground" "11 background" "12 cursor-color" \
+                  "17 selection-background" "19 selection-foreground"; do
+        key="${pair%% *}"; val="${pair#* }"
+        v=$(field "$f" "$val")
+        [ -n "$v" ] && printf '\033]%s;%s\a' "$key" "$v"
+      done
+      for i in $(seq 0 15); do
+        v=$(palette "$f" "$i")
+        [ -n "$v" ] && printf '\033]4;%d;%s\a' "$i" "$v"
+      done
+    } > /dev/tty
+  ) 2>/dev/null || true
+}
+
+# --- preview pane --------------------------------------------------------
+# A mock terminal painted in the theme's own colours, so the pane stays
+# readable where a live repaint can't reach (ssh, tmux, another terminal).
+W=40
+# Pad to a fixed visible width, ignoring the SGR escapes woven through the
+# text — hand-counting those is how mock panels end up ragged.
+row() { # row <rendered-text>
+  local s="$1" plain pad
+  plain=$(printf '%s' "$s" | sed $'s/\033\[[0-9;]*m//g')
+  pad=$(( W - ${#plain} )); (( pad < 0 )) && pad=0
+  printf '  %s%s%*s%s\n' "$BGC" "$s" "$pad" "" "$R"
+}
+
+preview() {
+  local name="$1"
+  local f="$THEMES_DIR/$name"
+  [ -f "$f" ] || { printf '\n  (missing theme file)\n'; return; }
+  local b fgc cur
+  b=$(field "$f" background); fgc=$(field "$f" foreground); cur=$(field "$f" cursor-color)
+  BGC=$(bg "$b")
+  local T grn blu red yel mag
+  T="${BGC}$(fg "$fgc")"
+  grn="${BGC}$(fg "$(palette "$f" 2)")"; blu="${BGC}$(fg "$(palette "$f" 4)")"
+  red="${BGC}$(fg "$(palette "$f" 1)")"; yel="${BGC}$(fg "$(palette "$f" 3)")"
+  mag="${BGC}$(fg "$(palette "$f" 5)")"
+
+  printf '\n'
+  if [ "$name" = "$(current_theme)" ]; then
+    printf '  \033[1m%s\033[0m  \033[2m· in config\033[0m\n\n' "$name"
+  else
+    printf '  \033[1m%s\033[0m\n\n' "$name"
+  fi
+
+  row ""
+  row "  ${grn}~/dotfiles ${blu}git:(${red}main${blu})"
+  row "  ${T}\$ git commit -m 'themes'"
+  row "  ${yel}2 files changed${T}, ${grn}+31 ${red}-4"
+  row "  ${mag}==> ${T}reloaded in 0.2s"
+  row "  $(bg "$cur") ${BGC}"
+  row ""
+  printf '\n'
+
+  # 16 palette slots: normal row above bright row.
+  local i out=''
+  for i in $(seq 0 7);  do out+="$(bg "$(palette "$f" "$i")")     "; done
+  printf '  %s%s\n' "$out" "$R"
+  out=''
+  for i in $(seq 8 15); do out+="$(bg "$(palette "$f" "$i")")     "; done
+  printf '  %s%s\n' "$out" "$R"
+}
+
+# --- persist -------------------------------------------------------------
+# Rewrite through the symlink rather than replacing it, so the dotfiles repo
+# sees an ordinary file change and the link survives.
+persist() {
+  local name="$1" tmp
+  tmp=$(mktemp)
+  if grep -qE '^[[:space:]]*theme[[:space:]]*=' "$CONFIG"; then
+    sed "s|^[[:space:]]*theme[[:space:]]*=.*|theme = $name|" "$CONFIG" > "$tmp"
+  else
+    cat "$CONFIG" > "$tmp"
+    printf '\ntheme = %s\n' "$name" >> "$tmp"
+  fi
+  cat "$tmp" > "$CONFIG"
+  rm -f "$tmp"
+}
+
+# --- entry points --------------------------------------------------------
+case "${1:-}" in
+  --preview) preview "$2"; exit 0 ;;
+  --repaint) repaint "$2"; exit 0 ;;
+  -l|--list) theme_names; exit 0 ;;
+  -e|--edit) shift; exec "$(dirname "$SELF")/ghostty-theme-edit" "$@" ;;
+  -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+
+[ -f "$CONFIG" ] || die "no config at $CONFIG"
+
+if [ -n "${1:-}" ]; then                      # non-interactive: name given
+  [ -f "$THEMES_DIR/$1" ] || die "unknown theme '$1' (try -l)"
+  persist "$1"; repaint "$1"
+  printf 'theme = %s\n' "$1"; exit 0
+fi
+
+command -v fzf >/dev/null || die "fzf not found (brew install fzf)"
+original=$(current_theme)
+
+picked=$(theme_names | fzf \
+  --height=100% --layout=reverse --info=inline --pointer='>' \
+  --prompt='theme > ' \
+  --header='enter apply · esc cancel' --header-lines=0 \
+  --preview="'$SELF' --preview {}" --preview-window='right:50:border-left' \
+  --bind="focus:execute-silent('$SELF' --repaint {})" \
+) || picked=''
+
+if [ -z "$picked" ]; then
+  [ -n "$original" ] && repaint "$original"   # put the old colours back
+  exit 0
+fi
+
+persist "$picked"
+repaint "$picked"
+printf 'theme = %s\n' "$picked"
