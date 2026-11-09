@@ -1,6 +1,6 @@
 # The preset kit
 
-`lib/preset_kit.py` is the shared frame for a tool that keeps named presets for one thing and lets you pick one. A preset says which elements show, in what order, and the value of each setting. Every tool on the kit has the same command line, files and keys. Four tools are built on it. `statusline-config` and `starship-config` pick which stats and prompt modules show. `ghostty-config` and `terminal-config` set Ghostty's and macOS Terminal's look and feel.
+`lib/preset_kit.py` is the shared frame for a tool that keeps named presets for one thing and lets you pick one. A preset says which elements show, in what order, and the value of each setting. Every tool on the kit has the same command line, files and keys. Five tools are built on it. `statusline-config` and `starship-config` pick which stats and prompt modules show. `ghostty-config` and `terminal-config` set Ghostty's and macOS Terminal's look and feel. `layout` opens Ghostty windows of tabs and split panes.
 
 ## What a tool supplies
 
@@ -59,6 +59,7 @@ All optional. The kit calls them, and a tool overrides the ones it needs.
 | `live(preset)` | on hover and on each change | repaint the window in the preset's colours |
 | `restore()` | when the picker closes | put the window's colours back |
 | `applied(name, preset)` | when a preset goes into use, or the one in use is edited | write the config fragment |
+| `used(name, preset)` | on `enter` in the menu or `tool <preset>`, even for the one in use | nothing; `layout` opens its window here |
 
 ## Colour
 
@@ -135,3 +136,9 @@ The theme is a `choice` whose options come from a callable: your themes, then Gh
 ## A fourth example: starship-config
 
 `bin/starship-config` picks which Starship modules show, as `show` elements, over a base config: your own, none, or one of Starship's built-in presets. Each built-in becomes a kit preset of its own. `applied()` writes the base with a new top-level `format` to `~/.local/state/starship-config/active.toml`, and a zsh hook points `STARSHIP_CONFIG` at it before every prompt. Setting `hue` turns on a one-hue theme: each shown module, in order, takes the next of `ramp(n, lightness first, lightness last)` at that hue and strength, written into its table's `style`. The `one-hue` preset starts from your config's modules. With `-H`, the tool overrides `active()`, `set_active()` and `draft_path` to keep the pick and its unsaved changes for one project instead.
+
+## A fifth example: layout
+
+`bin/layout` keeps Ghostty windows as presets. A preset has a theme and up to three tabs. Each tab has a shape, a title, and up to four panes with a directory and a command. The shapes are one, side by side, stacked, top and two, left and two, three across, and grid. A tab with no shape does not open. Panes past the shape's count are ignored.
+
+`used()` opens the preset as a new window through Ghostty's AppleScript, so editing never opens one. Each pane types its command, so the window shows what ran. A theme goes in as `ghostty-theme --repaint <theme>` before the command. `render()` sketches each tab as boxes with each pane's command and directory. `layout --script NAME` prints the AppleScript instead of running it.

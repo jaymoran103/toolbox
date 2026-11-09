@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""layout — Ghostty windows of tabs and split panes, kept as presets.
+
+A preset is one window: a theme, and up to three tabs. Each tab has a
+shape and up to four panes, and each pane a directory and a command.
+Using a preset, with enter in the menu or `layout <preset>`, opens it as
+a new Ghostty window through Ghostty's AppleScript. Each pane types its
+command where you can see it, so the window shows what ran.
+
+  layout --print NAME    sketch a preset
+  layout --script NAME   print the AppleScript it would run
+"""
+
+import os
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
+from preset_kit import BG, DIM, FG, HEX, Element, Tool, main, sibling  # noqa: E402
+
+HOME = os.path.expanduser("~")
+THEMES = os.environ.get("GHOSTTY_THEMES_DIR", os.path.join(HOME, ".config", "ghostty", "themes"))
+RESOURCES = [d for d in (os.environ.get("GHOSTTY_RESOURCES_DIR"),
+                         "/Applications/Ghostty.app/Contents/Resources/ghostty",
+                         "/usr/share/ghostty") if d]
+LINE = re.compile(r"^\s*([A-Za-z0-9-]+)\s*=\s*(.*?)\s*$")
+R = "\x1b[0m"
+
+TABS = 3
+PANES = 4
+
+# Each shape: how to split, and where each pane sits for the sketch.
+# A split is (pane to split, direction); the new pane takes the next number.
+# A box is (x, y, w, h) as fractions of the window.
+SHAPES = {
+    "one": ([], [(0, 0, 1, 1)]),
+    "side by side": ([(0, "right")], [(0, 0, .5, 1), (.5, 0, .5, 1)]),
+    "stacked": ([(0, "down")], [(0, 0, 1, .5), (0, .5, 1, .5)]),
+    "top and two": ([(0, "down"), (1, "right")],
+                    [(0, 0, 1, .5), (0, .5, .5, .5), (.5, .5, .5, .5)]),
+    "left and two": ([(0, "right"), (1, "down")],
+                     [(0, 0, .5, 1), (.5, 0, .5, .5), (.5, .5, .5, .5)]),
+    "three across": ([(0, "right"), (1, "right")],
+                     [(0, 0, 1 / 3, 1), (1 / 3, 0, 1 / 3, 1), (2 / 3, 0, 1 / 3, 1)]),
+    "grid": ([(0, "right"), (0, "down"), (1, "down")],
+             [(0, 0, .5, .5), (.5, 0, .5, .5), (0, .5, .5, .5), (.5, .5, .5, .5)]),
+}
+
+
+# --- themes -------------------------------------------------------------------
+
+def theme_file(name):
+    for d in [THEMES] + [os.path.join(r, "themes") for r in RESOURCES]:
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def theme_names():
+    mine = sorted(n for n in os.listdir(THEMES) if not n.startswith(".")) if os.path.isdir(THEMES) else []
+    for r in RESOURCES:
+        d = os.path.join(r, "themes")
+        if os.path.isdir(d):
+            return mine + sorted((n for n in os.listdir(d) if n not in mine), key=str.lower)
+    return mine
+
+
+def theme_colours(name):
+    path = theme_file(name) if name else None
+    out = {}
+    if path:
+        with open(path) as f:
+            for line in f:
+                m = LINE.match(line)
+                if m and m.group(1) in ("background", "foreground"):
+                    v = m.group(2) if m.group(2).startswith("#") else "#" + m.group(2)
+                    if HEX.fullmatch(v):
+                        out[m.group(1)] = v.lower()
+    return out
+
+
+# --- the tool -------------------------------------------------------------------
+
+def tab_elements(t):
+    g = f"Tab {t}"
+    out = [Element(f"t{t}-shape", "shape", kind="choice", choices=tuple(SHAPES), group=g,
+                   optional=t > 1),
+           Element(f"t{t}-title", "title", kind="text", group=g, optional=True)]
+    for p in range(1, PANES + 1):
+        out += [Element(f"t{t}-p{p}-dir", f"pane {p} dir", kind="text", group=g, optional=True),
+                Element(f"t{t}-p{p}-cmd", f"pane {p} command", kind="text", group=g, optional=True)]
+    return out
+
+
+def tabs(preset):
+    """[(title, [(dir, cmd), ...]), ...] for the tabs a preset opens."""
+    s = preset["set"]
+    out = []
+    for t in range(1, TABS + 1):
+        shape = s.get(f"t{t}-shape")
+        if not shape:
+            continue
+        panes = [(s.get(f"t{t}-p{p}-dir") or "~", s.get(f"t{t}-p{p}-cmd") or "")
+                 for p in range(1, len(SHAPES[shape][1]) + 1)]
+        out.append((shape, s.get(f"t{t}-title") or "", panes))
+    return out
+
+
+def q(text):
+    """An AppleScript string literal."""
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+class Layout(Tool):
+    name = "layout"
+    title = "Ghostty windows of tabs and panes"
+    pickup = "enter opens it in a new window"
+    list_shows = False
+    elements = (Element("theme", "theme", kind="choice", choices=theme_names, group="Window",
+                        optional=True),
+                *[e for t in range(1, TABS + 1) for e in tab_elements(t)])
+    builtins = {
+        "default": {"set": {"t1-shape": "one"}},
+        "pair": {"set": {"t1-shape": "side by side"}},
+        "trio": {"set": {"t1-shape": "top and two"}},
+        "grid": {"set": {"t1-shape": "grid"}},
+    }
+
+    # --- opening ----------------------------------------------------------------
+
+    def pane_config(self, preset, d, cmd):
+        """A surface configuration: where the pane starts, and what it types.
+        The theme goes in as a visible ghostty-theme --repaint."""
+        theme = preset["set"].get("theme")
+        typed = [f"ghostty-theme --repaint {theme}"] if theme and sibling("ghostty-theme") else []
+        typed += [cmd] if cmd else []
+        parts = [f"initial working directory:{q(os.path.expanduser(d))}"]
+        if typed:
+            parts.append(f"initial input:{q('; '.join(typed))} & linefeed")
+        return "{" + ", ".join(parts) + "}"
+
+    def script(self, preset):
+        lines = ['tell application "Ghostty"']
+        for i, (shape, title, panes) in enumerate(tabs(preset)):
+            first = self.pane_config(preset, *panes[0])
+            if i == 0:
+                lines += [f"  set w to new window with configuration {first}",
+                          "  set t to selected tab of w"]
+            else:
+                lines.append(f"  set t to new tab in w with configuration {first}")
+            lines.append("  set p0 to focused terminal of t")
+            for n, (src, way) in enumerate(SHAPES[shape][0], start=1):
+                lines.append(f"  set p{n} to split p{src} direction {way}"
+                             f" with configuration {self.pane_config(preset, *panes[n])}")
+            if len(panes) > 2:
+                lines.append('  perform action "equalize_splits" on p0')
+            if title:
+                lines.append(f"  perform action {q('set_tab_title:' + title)} on p0")
+            lines.append("  focus p0")
+            if i == 0:
+                lines.append("  set mainpane to p0")
+        lines += ["  focus mainpane", "end tell"]
+        return "\n".join(lines) + "\n"
+
+    def used(self, name, preset):
+        if not tabs(preset):
+            return "no tabs to open"
+        r = subprocess.run(["osascript", "-"], input=self.script(preset), text=True,
+                           capture_output=True)
+        if r.returncode:
+            return "Ghostty said: " + (r.stderr.strip().splitlines() or ["no reason"])[-1]
+        return "opened in a new window"
+
+    # --- preview --------------------------------------------------------------
+
+    def render(self, preset, width):
+        c = theme_colours(preset["set"].get("theme"))
+        bg, fg = c.get("background"), c.get("foreground")
+        w = max(24, min(width, 52))
+        h = 9
+        out = []
+        for shape, title, panes in tabs(preset):
+            head = f"{shape}" + (f" · {title}" if title else "")
+            out.append(DIM + head + R)
+            for row in self.sketch(SHAPES[shape][1], panes, w, h):
+                out.append((BG(bg) + FG(fg) if bg and fg else "") + row + R)
+            out.append("")
+        theme = preset["set"].get("theme")
+        out.append(DIM + "theme" + R + "  " + (theme or "– your Ghostty config's"))
+        return out
+
+    def sketch(self, boxes, panes, w, h):
+        """Box drawing of the panes, with each pane's number, command and dir."""
+        grid = [[0] * w for _ in range(h)]   # bits: 1 up, 2 down, 4 left, 8 right
+        cells = []
+        for x, y, bw, bh in boxes:
+            x0, y0 = round(x * (w - 1)), round(y * (h - 1))
+            x1, y1 = round((x + bw) * (w - 1)), round((y + bh) * (h - 1))
+            cells.append((x0, y0, x1, y1))
+            for i in range(x0, x1 + 1):
+                for j in (y0, y1):
+                    grid[j][i] |= (4 if i > x0 else 0) | (8 if i < x1 else 0)
+            for j in range(y0, y1 + 1):
+                for i in (x0, x1):
+                    grid[j][i] |= (1 if j > y0 else 0) | (2 if j < y1 else 0)
+        chars = {0: " ", 3: "│", 12: "─", 10: "┌", 6: "┐", 9: "└", 5: "┘",
+                 11: "├", 7: "┤", 14: "┬", 13: "┴", 15: "┼", 1: "│", 2: "│", 4: "─", 8: "─"}
+        canvas = [[chars.get(b, " ") for b in row] for row in grid]
+        for n, ((x0, y0, x1, y1), (d, cmd)) in enumerate(zip(cells, panes), start=1):
+            room = x1 - x0 - 2
+            for k, text in enumerate([f"{n} {cmd or 'shell'}", f"  {d}"]):
+                j = y0 + 1 + k
+                if j < y1 and room > 0:
+                    text = text if len(text) <= room else text[:room - 1] + "…"
+                    canvas[j][x0 + 2:x0 + 2 + len(text)] = list(text)
+        return ["".join(row) for row in canvas]
+
+
+if __name__ == "__main__":
+    tool = Layout()
+    if sys.argv[1:2] == ["--script"]:
+        name = sys.argv[2] if len(sys.argv) > 2 else None
+        preset = tool.load(name) if name else tool.active_preset()
+        if preset is None:
+            sys.exit(f"layout: no preset '{name}' (try -l)")
+        sys.stdout.write(tool.script(preset))
+    else:
+        main(tool, sys.argv[1:])

@@ -247,6 +247,12 @@ class Tool:
         """The preset in use changed, or the one in use was edited. A tool
         whose target cannot read the pick at run time writes it out here."""
 
+    def used(self, name, preset):
+        """The person chose this preset now: enter in the menu, or `tool
+        <preset>`. Called even when it is already in use, after applied().
+        A tool that does something once per use, like opening a window,
+        does it here. Return a short line for the footer, or None."""
+
     # --- files ----------------------------------------------------------------
     # Presets of yours: ~/.config/<name>/presets/<preset>.json, which
     # install.sh links to the toolbox's presets/<name>/. The pick:
@@ -490,7 +496,8 @@ def main(tool, argv):
         if tool.draft() and a != tool.active():
             die(unsaved())
         tool.set_active(a)
-        print(a)
+        said = tool.used(a, tool.active_preset())
+        print(a + (f" · {said}" if said else ""))
     elif a:
         e = tool.find(a) or die(f"no preset or setting '{a}' (try -l or -h)")
         preset = tool.active_preset()
@@ -728,7 +735,8 @@ class App:
 
     def use(self):
         name = self.hovered()
-        self.say(f"✓ in use · {name} · {self.t.pickup}", GREEN)
+        said = self.t.used(name, self.t.active_preset())
+        self.say(f"✓ in use · {name} · {said or self.t.pickup}", GREEN)
 
     def open(self, name):
         self.name, self.preset = name, self.t.active_preset()
