@@ -7,7 +7,7 @@ Using a preset, with enter in the menu or `layout <preset>`, lays it out
 through Ghostty's AppleScript. Run from Ghostty, it takes over the tab
 you ran it in: that pane becomes pane 1, the tab's other panes close, and
 later tabs open beside it in the same window. Each pane types its
-command where you can see it, so the window shows what ran. A tab's
+command, after a clear and one line naming the preset and theme. A tab's
 theme, else the window's, colours each of its panes.
 
   layout -n NAME         open a new window instead
@@ -128,6 +128,7 @@ class Layout(Tool):
     pickup = "enter lays it out in this tab"
     new_window = False   # -n, or run outside Ghostty
     leave = False        # set by used(): the menu quits so the tab can be taken
+    using = ""           # the preset being laid out, for each pane's first line
     list_shows = False
     elements = (Element("theme", "theme", kind="choice", choices=theme_names, group="Window",
                         optional=True),
@@ -142,10 +143,13 @@ class Layout(Tool):
     # --- opening ----------------------------------------------------------------
 
     def typed(self, theme, d, cmd, cd=False):
-        """What a pane types: a cd when it is not new, the theme as a visible
-        ghostty-theme --repaint, then its command."""
+        """What a pane types: a cd when it is not new, the theme as a
+        ghostty-theme --repaint, a clear and one line saying what it is, then
+        its command."""
         out = [f"cd {d}"] if cd else []
         out += [f"ghostty-theme --repaint {theme}"] if theme and sibling("ghostty-theme") else []
+        said = f"[layout] - preset:{self.using}" + (f" - theme:{theme}" if theme else "")
+        out += ["clear", "printf '%s\\n' " + "'" + said.replace("'", "") + "'"]
         return "; ".join(out + ([cmd] if cmd else []))
 
     def pane_config(self, theme, d, cmd):
@@ -181,10 +185,10 @@ class Layout(Tool):
             elif i == 0:
                 lines += [f"  set w to new window with configuration {first}",
                           "  set t to selected tab of w",
-                          "  set p0 to focused terminal of t"]
+                          "  set p0 to first terminal whose id is (id of focused terminal of t)"]
             else:
                 lines += [f"  set t to new tab in w with configuration {first}",
-                          "  set p0 to focused terminal of t"]
+                          "  set p0 to first terminal whose id is (id of focused terminal of t)"]
             for n, (src, way) in enumerate(SHAPES[shape][0], start=1):
                 lines.append(f"  set p{n} to split p{src} direction {way}"
                              f" with configuration {self.pane_config(theme, *panes[n])}")
@@ -193,8 +197,9 @@ class Layout(Tool):
             if title:
                 lines.append(f"  perform action {q('set_tab_title:' + title)} on p0")
             if i == 0:
-                lines += ["  set mainpane to p0", "  set tab1 to t"]
-        lines += ["  select tab tab1", "  focus mainpane", "  return id of mainpane", "end tell"]
+                lines += ["  set mainid to id of p0", "  set tab1id to id of t"]
+        lines += ["  select tab (first tab of w whose id is tab1id)",
+                  "  focus (first terminal whose id is mainid)", "  return mainid", "end tell"]
         return "\n".join(lines) + "\n"
 
     def typing(self, preset, tid):
@@ -226,6 +231,7 @@ class Layout(Tool):
         return mark
 
     def used(self, name, preset):
+        self.using = name
         if not tabs(preset):
             return "no tabs to open"
         here = self.take_here()
@@ -299,6 +305,7 @@ if __name__ == "__main__":
         preset = tool.load(name) if name else tool.active_preset()
         if preset is None:
             sys.exit(f"layout: no preset '{name}' (try -l)")
+        tool.using = name or tool.active()
         sys.stdout.write(tool.script(preset))
     else:
         main(tool, sys.argv[1:])
