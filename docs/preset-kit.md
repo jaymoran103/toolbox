@@ -59,7 +59,7 @@ All optional. The kit calls them, and a tool overrides the ones it needs.
 | `live(preset)` | on hover and on each change | repaint the window in the preset's colours |
 | `restore()` | when the picker closes | put the window's colours back |
 | `applied(name, preset)` | when a preset goes into use, or the one in use is edited | write the config fragment |
-| `used(name, preset)` | on `enter` in the menu or `tool <preset>`, even for the one in use | nothing; `layout` opens its window here |
+| `used(name, preset)` | on `enter` in the menu or `tool <preset>`, even for the one in use; setting `self.leave` quits the menu after | nothing; `layout` lays its window out here |
 
 ## Colour
 
@@ -139,6 +139,6 @@ The theme is a `choice` whose options come from a callable: your themes, then Gh
 
 ## A fifth example: layout
 
-`bin/layout` keeps Ghostty windows as presets. A preset has a theme and up to three tabs. Each tab has a shape, a title, and up to four panes with a directory and a command. The shapes are one, side by side, stacked, top and two, left and two, three across, and grid. A tab with no shape does not open. Panes past the shape's count are ignored.
+`bin/layout` keeps Ghostty windows as presets. A preset has a window theme and up to three tabs. Each tab has a shape, a title, its own theme, and up to four panes with a directory and a command. A tab with no theme takes the window's. The shapes are one, side by side, stacked, top and two, left and two, three across, and grid. A tab with no shape does not open. Panes past the shape's count are ignored.
 
-`used()` opens the preset as a new window through Ghostty's AppleScript, so editing never opens one. Each pane types its command, so the window shows what ran. A theme goes in as `ghostty-theme --repaint <theme>` before the command. `render()` sketches each tab as boxes with each pane's command and directory. `layout --script NAME` prints the AppleScript instead of running it.
+`used()` lays the preset out through Ghostty's AppleScript, so editing never does. Run from Ghostty, it takes over the tab it ran in: it titles that pane with a mark to find it, closes the tab's other panes, splits from it, and opens later tabs in the same window. It sets `leave` so the menu quits, and types pane 1's line a beat later, once the shell has the terminal back. `layout -n` and any terminal other than Ghostty open a new window instead. Each pane types its command, so the window shows what ran. A theme goes in as `ghostty-theme --repaint <theme>` before the command. `render()` sketches each tab as boxes with each pane's command and directory. `layout --script NAME` prints the AppleScript instead of running it.

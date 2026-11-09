@@ -3,18 +3,23 @@
 
 A preset is one window: a theme, and up to three tabs. Each tab has a
 shape and up to four panes, and each pane a directory and a command.
-Using a preset, with enter in the menu or `layout <preset>`, opens it as
-a new Ghostty window through Ghostty's AppleScript. Each pane types its
-command where you can see it, so the window shows what ran.
+Using a preset, with enter in the menu or `layout <preset>`, lays it out
+through Ghostty's AppleScript. Run from Ghostty, it takes over the tab
+you ran it in: that pane becomes pane 1, the tab's other panes close, and
+later tabs open beside it in the same window. Each pane types its
+command where you can see it, so the window shows what ran. A tab's
+theme, else the window's, colours each of its panes.
 
+  layout -n NAME         open a new window instead
   layout --print NAME    sketch a preset
-  layout --script NAME   print the AppleScript it would run
+  layout --script NAME   print the AppleScript for a new window
 """
 
 import os
 import re
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"))
 from preset_kit import BG, DIM, FG, HEX, Element, Tool, main, sibling  # noqa: E402
@@ -87,7 +92,9 @@ def tab_elements(t):
     g = f"Tab {t}"
     out = [Element(f"t{t}-shape", "shape", kind="choice", choices=tuple(SHAPES), group=g,
                    optional=t > 1),
-           Element(f"t{t}-title", "title", kind="text", group=g, optional=True)]
+           Element(f"t{t}-title", "title", kind="text", group=g, optional=True),
+           Element(f"t{t}-theme", "theme", kind="choice", choices=theme_names, group=g,
+                   optional=True)]
     for p in range(1, PANES + 1):
         out += [Element(f"t{t}-p{p}-dir", f"pane {p} dir", kind="text", group=g, optional=True),
                 Element(f"t{t}-p{p}-cmd", f"pane {p} command", kind="text", group=g, optional=True)]
@@ -95,7 +102,8 @@ def tab_elements(t):
 
 
 def tabs(preset):
-    """[(title, [(dir, cmd), ...]), ...] for the tabs a preset opens."""
+    """[(shape, title, theme, [(dir, cmd), ...]), ...] for the tabs a preset
+    opens. A tab with no theme of its own takes the window's."""
     s = preset["set"]
     out = []
     for t in range(1, TABS + 1):
@@ -104,7 +112,8 @@ def tabs(preset):
             continue
         panes = [(s.get(f"t{t}-p{p}-dir") or "~", s.get(f"t{t}-p{p}-cmd") or "")
                  for p in range(1, len(SHAPES[shape][1]) + 1)]
-        out.append((shape, s.get(f"t{t}-title") or "", panes))
+        out.append((shape, s.get(f"t{t}-title") or "", s.get(f"t{t}-theme") or s.get("theme"),
+                    panes))
     return out
 
 
@@ -116,7 +125,9 @@ def q(text):
 class Layout(Tool):
     name = "layout"
     title = "Ghostty windows of tabs and panes"
-    pickup = "enter opens it in a new window"
+    pickup = "enter lays it out in this tab"
+    new_window = False   # -n, or run outside Ghostty
+    leave = False        # set by used(): the menu quits so the tab can be taken
     list_shows = False
     elements = (Element("theme", "theme", kind="choice", choices=theme_names, group="Window",
                         optional=True),
@@ -130,65 +141,125 @@ class Layout(Tool):
 
     # --- opening ----------------------------------------------------------------
 
-    def pane_config(self, preset, d, cmd):
-        """A surface configuration: where the pane starts, and what it types.
-        The theme goes in as a visible ghostty-theme --repaint."""
-        theme = preset["set"].get("theme")
-        typed = [f"ghostty-theme --repaint {theme}"] if theme and sibling("ghostty-theme") else []
-        typed += [cmd] if cmd else []
+    def typed(self, theme, d, cmd, cd=False):
+        """What a pane types: a cd when it is not new, the theme as a visible
+        ghostty-theme --repaint, then its command."""
+        out = [f"cd {d}"] if cd else []
+        out += [f"ghostty-theme --repaint {theme}"] if theme and sibling("ghostty-theme") else []
+        return "; ".join(out + ([cmd] if cmd else []))
+
+    def pane_config(self, theme, d, cmd):
+        """A surface configuration: where a new pane starts, and what it types."""
         parts = [f"initial working directory:{q(os.path.expanduser(d))}"]
+        typed = self.typed(theme, d, cmd)
         if typed:
-            parts.append(f"initial input:{q('; '.join(typed))} & linefeed")
+            parts.append(f"initial input:{q(typed)} & linefeed")
         return "{" + ", ".join(parts) + "}"
 
-    def script(self, preset):
+    def script(self, preset, here=None):
+        """The AppleScript that lays the preset out. With here, the title of
+        the pane this ran in, that pane becomes pane 1 of tab 1 and the rest
+        of its tab closes; pane 1's own typing is left to typing()."""
         lines = ['tell application "Ghostty"']
-        for i, (shape, title, panes) in enumerate(tabs(preset)):
-            first = self.pane_config(preset, *panes[0])
-            if i == 0:
+        for i, (shape, title, theme, panes) in enumerate(tabs(preset)):
+            first = self.pane_config(theme, *panes[0])
+            if i == 0 and here:
+                lines += [f"  set p0 to first terminal whose name is {q(here)}",
+                          "  set tid to id of p0",
+                          "  repeat with ww in windows",
+                          "    repeat with tt in tabs of ww",
+                          "      if exists (terminals of tt whose id is tid) then",
+                          "        set w to contents of ww",
+                          "        set t to contents of tt",
+                          "      end if",
+                          "    end repeat",
+                          "  end repeat",
+                          "  repeat with x in (terminals of t whose id is not tid)",
+                          "    close x",
+                          "  end repeat",
+                          "  delay 0.3"]
+            elif i == 0:
                 lines += [f"  set w to new window with configuration {first}",
-                          "  set t to selected tab of w"]
+                          "  set t to selected tab of w",
+                          "  set p0 to focused terminal of t"]
             else:
-                lines.append(f"  set t to new tab in w with configuration {first}")
-            lines.append("  set p0 to focused terminal of t")
+                lines += [f"  set t to new tab in w with configuration {first}",
+                          "  set p0 to focused terminal of t"]
             for n, (src, way) in enumerate(SHAPES[shape][0], start=1):
                 lines.append(f"  set p{n} to split p{src} direction {way}"
-                             f" with configuration {self.pane_config(preset, *panes[n])}")
+                             f" with configuration {self.pane_config(theme, *panes[n])}")
             if len(panes) > 2:
                 lines.append('  perform action "equalize_splits" on p0')
             if title:
                 lines.append(f"  perform action {q('set_tab_title:' + title)} on p0")
-            lines.append("  focus p0")
             if i == 0:
-                lines.append("  set mainpane to p0")
-        lines += ["  focus mainpane", "end tell"]
+                lines += ["  set mainpane to p0", "  set tab1 to t"]
+        lines += ["  select tab tab1", "  focus mainpane", "  return id of mainpane", "end tell"]
         return "\n".join(lines) + "\n"
+
+    def typing(self, preset, tid):
+        """Pane 1's typing when it was taken over, sent once this program has
+        let go of the terminal, so the shell reads it rather than us."""
+        shape, title, theme, panes = tabs(preset)[0]
+        typed = self.typed(theme, panes[0][0], panes[0][1], cd=True)
+        # input text pastes, and a pasted newline does not run the line in
+        # zsh, so enter goes in as a key.
+        return ('tell application "Ghostty"\n'
+                f"  set p to first terminal whose id is {q(tid)}\n"
+                f"  input text {q(typed)} to p\n"
+                '  send key "enter" to p\n'
+                "end tell\n")
+
+    def take_here(self):
+        """Mark the pane this runs in with a title only it has, so the
+        AppleScript can find it. None outside Ghostty."""
+        if self.new_window or os.environ.get("TERM") != "xterm-ghostty":
+            return None
+        mark = f"layout-{os.getpid()}-{int(time.time())}"
+        try:
+            fd = os.open("/dev/tty", os.O_WRONLY)
+            os.write(fd, f"\x1b]2;{mark}\a".encode())
+            os.close(fd)
+        except OSError:
+            return None
+        time.sleep(0.2)
+        return mark
 
     def used(self, name, preset):
         if not tabs(preset):
             return "no tabs to open"
-        r = subprocess.run(["osascript", "-"], input=self.script(preset), text=True,
+        here = self.take_here()
+        r = subprocess.run(["osascript", "-"], input=self.script(preset, here), text=True,
                            capture_output=True)
         if r.returncode:
             return "Ghostty said: " + (r.stderr.strip().splitlines() or ["no reason"])[-1]
-        return "opened in a new window"
+        if not here:
+            return "opened in a new window"
+        # Detached and a beat late: the menu or this command has exited by then.
+        later = subprocess.Popen(["sh", "-c", "sleep 0.6; exec osascript -"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True, text=True)
+        later.stdin.write(self.typing(preset, r.stdout.strip()))
+        later.stdin.close()
+        self.leave = True
+        return "laid out here"
 
     # --- preview --------------------------------------------------------------
 
     def render(self, preset, width):
-        c = theme_colours(preset["set"].get("theme"))
-        bg, fg = c.get("background"), c.get("foreground")
         w = max(24, min(width, 52))
         h = 9
         out = []
-        for shape, title, panes in tabs(preset):
-            head = f"{shape}" + (f" · {title}" if title else "")
+        for shape, title, theme, panes in tabs(preset):
+            c = theme_colours(theme)
+            bg, fg = c.get("background"), c.get("foreground")
+            head = f"{shape}" + (f" · {title}" if title else "") + (f" · {theme}" if theme else "")
             out.append(DIM + head + R)
             for row in self.sketch(SHAPES[shape][1], panes, w, h):
                 out.append((BG(bg) + FG(fg) if bg and fg else "") + row + R)
             out.append("")
         theme = preset["set"].get("theme")
-        out.append(DIM + "theme" + R + "  " + (theme or "– your Ghostty config's"))
+        out.append(DIM + "window theme" + R + "  " + (theme or "– your Ghostty config's"))
         return out
 
     def sketch(self, boxes, panes, w, h):
@@ -220,6 +291,9 @@ class Layout(Tool):
 
 if __name__ == "__main__":
     tool = Layout()
+    if sys.argv[1:2] in (["-n"], ["--new"]):
+        tool.new_window = True
+        del sys.argv[1]
     if sys.argv[1:2] == ["--script"]:
         name = sys.argv[2] if len(sys.argv) > 2 else None
         preset = tool.load(name) if name else tool.active_preset()

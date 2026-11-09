@@ -251,7 +251,9 @@ class Tool:
         """The person chose this preset now: enter in the menu, or `tool
         <preset>`. Called even when it is already in use, after applied().
         A tool that does something once per use, like opening a window,
-        does it here. Return a short line for the footer, or None."""
+        does it here. Return a short line for the footer, or None. Set
+        `self.leave = True` to close the menu after, as when the tool takes
+        over this terminal."""
 
     # --- files ----------------------------------------------------------------
     # Presets of yours: ~/.config/<name>/presets/<preset>.json, which
@@ -737,6 +739,8 @@ class App:
         name = self.hovered()
         said = self.t.used(name, self.t.active_preset())
         self.say(f"✓ in use · {name} · {said or self.t.pickup}", GREEN)
+        if getattr(self.t, "leave", False):
+            self.done = True
 
     def open(self, name):
         self.name, self.preset = name, self.t.active_preset()
