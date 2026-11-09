@@ -1,0 +1,17 @@
+{
+  "name": "layout",
+  "about": "Ghostty windows of tabs and split panes, kept as presets",
+  "template": "preset-kit",
+  "entries": [
+    "bin/layout"
+  ],
+  "links": {
+    "presets/layout": "~/.config/layout/presets"
+  },
+  "needs": [
+    "python3",
+    "ghostty",
+    "osascript"
+  ],
+  "shortcuts": {}
+}
